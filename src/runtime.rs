@@ -265,63 +265,76 @@ impl Runtime {
                     return Ok(());
                 }
 
-                // Execute tools and add results
+                // Execute tools and add results. We must always produce a tool_result for
+                // every tool_use we just pushed onto the assistant message — otherwise the
+                // next API call will fail with "tool_use ids were found without tool_result
+                // blocks". On cancellation we synthesize a "Cancelled by user" result for any
+                // remaining tools so message history stays valid.
                 let mut tool_results = Vec::new();
+                let mut cancelled = false;
 
                 for tool_use in tool_uses {
-                    // Check for cancellation before each tool execution
-                    if cancel.is_cancelled() {
-                        let _ = tx.send(StreamEvent::MessageHistory(messages));
-                        return Ok(());
+                    let tool_id = tool_use["id"].as_str().unwrap_or("").to_string();
+                    let tool_name = tool_use["name"].as_str().unwrap_or("").to_string();
+                    let input = tool_use["input"].clone();
+
+                    if tool_id.is_empty() || tool_name.is_empty() {
+                        continue;
                     }
 
-                    if let (Some(tool_name), Some(tool_id)) = (
-                        tool_use["name"].as_str(),
-                        tool_use["id"].as_str()
-                    ) {
-                        let input = &tool_use["input"];
-
-                        // Send tool use event
-                        let _ = tx.send(StreamEvent::ToolUse {
-                            tool_name: tool_name.to_string(),
-                            tool_id: tool_id.to_string(),
-                            input: input.clone(),
-                        });
-
-                        let result = match self.tools.get(tool_name) {
-                            Some(tool) => {
-                                // Race tool execution against cancellation
-                                tokio::select! {
-                                    res = tool.execute(input.clone()) => {
-                                        match res {
-                                            Ok(output) => output,
-                                            Err(e) => format!("Tool execution failed: {}", e),
-                                        }
-                                    }
-                                    _ = cancel.cancelled() => {
-                                        let _ = tx.send(StreamEvent::MessageHistory(messages));
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                            None => format!("Unknown tool: {}", tool_name),
-                        };
-
-                        // Send tool result event
-                        let _ = tx.send(StreamEvent::ToolResult {
-                            tool_id: tool_id.to_string(),
-                            result: result.clone(),
-                        });
-
+                    // If cancellation already happened, fill in remaining slots with a
+                    // synthetic cancelled result rather than breaking out of the loop.
+                    if cancelled || cancel.is_cancelled() {
+                        cancelled = true;
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": result
+                            "content": "Cancelled by user"
                         }));
+                        continue;
                     }
+
+                    // Send tool use event
+                    let _ = tx.send(StreamEvent::ToolUse {
+                        tool_name: tool_name.clone(),
+                        tool_id: tool_id.clone(),
+                        input: input.clone(),
+                    });
+
+                    let result = match self.tools.get(&tool_name) {
+                        Some(tool) => {
+                            // Race tool execution against cancellation
+                            tokio::select! {
+                                res = tool.execute(input.clone()) => {
+                                    match res {
+                                        Ok(output) => output,
+                                        Err(e) => format!("Tool execution failed: {}", e),
+                                    }
+                                }
+                                _ = cancel.cancelled() => {
+                                    cancelled = true;
+                                    "Cancelled by user".to_string()
+                                }
+                            }
+                        }
+                        None => format!("Unknown tool: {}", tool_name),
+                    };
+
+                    // Send tool result event
+                    let _ = tx.send(StreamEvent::ToolResult {
+                        tool_id: tool_id.clone(),
+                        result: result.clone(),
+                    });
+
+                    tool_results.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": result
+                    }));
                 }
 
-                // Add tool results to conversation
+                // Add tool results to conversation — always, so the assistant's tool_use
+                // blocks have matching tool_result blocks even on cancellation.
                 messages.push(json!({
                     "role": "user",
                     "content": tool_results
@@ -329,6 +342,10 @@ impl Runtime {
 
                 // Send updated history after each tool loop iteration
                 let _ = tx.send(StreamEvent::MessageHistory(messages.clone()));
+
+                if cancelled {
+                    return Ok(());
+                }
 
                 // Continue the loop to get Claude's response with tool results
             } else {

@@ -1348,7 +1348,20 @@ async fn main() -> Result<()> {
                             app.streaming = false;
                             stream = None;
                             cancel_token = None;
-                            app.api_messages.pop();
+                            // Restore a valid trailing state. The runtime guarantees that
+                            // each tool_use has a matching tool_result, so we only need to
+                            // drop an unmatched trailing assistant message or a trailing
+                            // plain-text user message (so the user can retry cleanly).
+                            // We must NOT pop a trailing user tool_result message, because
+                            // that would orphan the preceding assistant tool_use blocks.
+                            if let Some(last) = app.api_messages.last() {
+                                let role = last["role"].as_str().unwrap_or("");
+                                let is_text_user = role == "user" && last["content"].is_string();
+                                let is_assistant = role == "assistant";
+                                if is_text_user || is_assistant {
+                                    app.api_messages.pop();
+                                }
+                            }
                         }
                     }
                     // Redraw immediately so tool calls appear before execution
