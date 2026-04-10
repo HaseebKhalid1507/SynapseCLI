@@ -503,12 +503,10 @@ impl Runtime {
                             in_thinking = false;
                         } else if in_tool_use {
                             // Parse the accumulated JSON input
-                            let input: Value = match serde_json::from_str(&current_tool_input_json) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    eprintln!("Warning: failed to parse tool input JSON: {}", e);
-                                    json!({})
-                                }
+                            let input: Value = if current_tool_input_json.trim().is_empty() {
+                                json!({})
+                            } else {
+                                serde_json::from_str(&current_tool_input_json).unwrap_or(json!({}))
                             };
 
                             accumulated_content.push(json!({
@@ -568,12 +566,10 @@ impl Runtime {
                                 "signature": current_thinking_signature
                             }));
                         } else if in_tool_use {
-                            let input: Value = match serde_json::from_str(&current_tool_input_json) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    eprintln!("Warning: failed to parse tool input JSON: {}", e);
-                                    json!({})
-                                }
+                            let input: Value = if current_tool_input_json.trim().is_empty() {
+                                json!({})
+                            } else {
+                                serde_json::from_str(&current_tool_input_json).unwrap_or(json!({}))
                             };
                             accumulated_content.push(json!({
                                 "type": "tool_use",

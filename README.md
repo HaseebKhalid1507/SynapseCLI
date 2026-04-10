@@ -1,4 +1,4 @@
-# agent-runtime
+# SynapsCLI
 
 A minimal, terminal-native AI agent runtime built in Rust. It connects to the Anthropic API, streams responses with extended thinking, executes tools in an autonomous loop, and presents everything through a polished TUI.
 
@@ -9,9 +9,11 @@ A minimal, terminal-native AI agent runtime built in Rust. It connects to the An
 - **7 built-in tools** — bash, read, write, edit, grep, find, ls
 - **TUI interface** — Full terminal UI with markdown rendering, syntax highlighting, and animations
 - **Session persistence** — Auto-saved sessions with `--continue` to resume any conversation
-- **Extended thinking** — Configurable thinking budgets (low/medium/high/xhigh) with summarized display
+- **Extended thinking** — Configurable thinking budgets (low/medium/high/xhigh or custom token count)
 - **Cost tracking** — Per-model pricing with session totals shown in the footer
-- **Dual auth** — OAuth and API key authentication
+- **API key auth** — Simple `ANTHROPIC_API_KEY` authentication
+- **Prefix commands** — Type `/q` instead of `/quit`, unambiguous prefixes resolve automatically
+- **Tab completion** — Tab-complete slash commands with longest common prefix matching
 
 ## Quick Start
 
@@ -25,16 +27,16 @@ A minimal, terminal-native AI agent runtime built in Rust. It connects to the An
 ```bash
 # Clone and build
 git clone <repo-url>
-cd agent-runtime
+cd SynapsCLI
 cargo build --release
 
 # Set your API key
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # Or create a config
-mkdir -p ~/.agent-runtime
-echo "model = claude-sonnet-4-20250514" > ~/.agent-runtime/config
-echo "thinking = medium" >> ~/.agent-runtime/config
+mkdir -p ~/.SynapsCLI
+echo "model = claude-sonnet-4-20250514" > ~/.SynapsCLI/config
+echo "thinking = medium" >> ~/.SynapsCLI/config
 ```
 
 ### Run
@@ -43,11 +45,17 @@ echo "thinking = medium" >> ~/.agent-runtime/config
 # TUI mode (recommended)
 cargo run --bin chatui
 
+# Continue the most recent session
+cargo run --bin chatui -- --continue
+
+# Continue a specific session (partial ID match)
+cargo run --bin chatui -- --continue 20260410-1430
+
 # Plain streaming chat
 cargo run --bin chat
 
 # Single prompt (non-streaming)
-cargo run --bin agent-runtime run "explain quicksort"
+cargo run --bin SynapsCLI run "explain quicksort"
 ```
 
 ## Architecture
@@ -68,10 +76,10 @@ src/
 
 The `Runtime` struct is the core engine. It handles:
 
-- **Authentication** — Reads OAuth tokens from `~/.pi/agent/auth.json`, falls back to `ANTHROPIC_API_KEY`
+- **Authentication** — Reads `ANTHROPIC_API_KEY` from the environment
 - **SSE streaming** — Parses `content_block_start`, `content_block_delta`, `content_block_stop` events, accumulating thinking blocks (with signatures), text, and tool use blocks
-- **Tool loop** — When the model returns `tool_use` blocks, executes each tool, sends results back, and continues until the model responds with text only
-- **Cancellation** — Accepts a `CancellationToken` that can abort between API calls, between tool executions, or mid-tool via `tokio::select!`
+- **Tool loop** — When the model returns `tool_use` blocks, executes each tool, sends results back, and continues until the model responds with text only. Updated message history is sent after each iteration so the UI stays in sync.
+- **Cancellation** — Accepts a `CancellationToken` that can abort between API calls, between tool executions, or mid-tool via `tokio::select!`. Partial message history is preserved on cancellation.
 
 Public API:
 
@@ -101,28 +109,102 @@ while let Some(event) = stream.next().await {
 let response = runtime.run_single("list files in src/").await?;
 ```
 
+#### SSE Event Handling
+
+The streaming parser processes these SSE event types:
+
+| Event Type | Description |
+|------------|-------------|
+| `content_block_start` | Marks beginning of a thinking, text, or tool_use block |
+| `content_block_delta` | Incremental content: `text_delta`, `thinking_delta`, `signature_delta`, `input_json_delta` |
+| `content_block_stop` | Finalizes the block, flushes accumulated content |
+| `message_start` | Message envelope with initial usage data |
+| `message_delta` | Token usage updates |
+| `message_stop` | Final message marker |
+
+Thinking blocks accumulate both the thinking text and a `signature` field across separate deltas. Both are stored and echoed back in tool loop continuations.
+
+API requests use `max_tokens: 128000` and `thinking.display: "summarized"`.
+
 ### Tools (`tools.rs`)
 
 Seven tools are registered by default:
 
 | Tool | Description |
 |------|-------------|
-| **bash** | Execute shell commands. Configurable timeout (default 30s, max 300s). Captures stdout + stderr. |
-| **read** | Read file contents with line numbers. Supports `offset` and `limit` for partial reads. |
-| **write** | Create or overwrite files. Atomic writes via temp file + rename. Auto-creates parent directories. |
-| **edit** | Surgical find-and-replace. `old_string` must match exactly once. Atomic write. |
-| **grep** | Regex search across files. Supports `include` glob filter, `context` lines. Excludes .git/node_modules/target. |
-| **find** | Glob-based file search. Supports `type` filter (f/d). Excludes noise directories. |
-| **ls** | Directory listing with permissions, size, and dates (`ls -lah`). |
+| **bash** | Execute shell commands via `/bin/bash -c`. Configurable `timeout` (default 30s, max 300s). Captures stdout + stderr. |
+| **read** | Read file contents with line numbers. Supports `offset` (starting line, 0-indexed) and `limit` (max lines). Reports remaining lines when truncated. |
+| **write** | Create or overwrite files. Atomic writes via temp file (`.agent-tmp`) + rename. Auto-creates parent directories. Reports line and byte counts. |
+| **edit** | Surgical find-and-replace. `old_string` must match exactly once (errors on zero or multiple matches). Atomic write. |
+| **grep** | Regex search via `grep -rn`. Supports `include` glob filter (e.g. `*.rs`), `context` lines. Excludes `.git`/`node_modules`/`target`. 15s timeout, 50KB output cap. |
+| **find** | Glob-based file search via `find`. Supports `type` filter (`f` for files, `d` for directories). Excludes noise directories. 10s timeout. |
+| **ls** | Directory listing via `ls -lah`. Shows permissions, size, and dates. |
 
 All tools expand `~` to `$HOME`. Tool results are streamed back to the TUI as they complete.
 
+#### Tool Parameters
+
+<details>
+<summary>Full parameter reference</summary>
+
+**bash**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `command` | string | yes | Shell command to execute |
+| `timeout` | integer | no | Timeout in seconds (default: 30, max: 300) |
+
+**read**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | File path to read |
+| `offset` | integer | no | Line number to start from (0-indexed) |
+| `limit` | integer | no | Maximum number of lines to read |
+
+**write**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | File path to write |
+| `content` | string | yes | File content |
+
+**edit**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | File path to edit |
+| `old_string` | string | yes | Exact text to find (must match once) |
+| `new_string` | string | yes | Replacement text |
+
+**grep**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pattern` | string | yes | Regex pattern |
+| `path` | string | no | Search directory (default: `.`) |
+| `include` | string | no | Glob filter (e.g. `*.rs`) |
+| `context` | integer | no | Context lines before and after matches |
+
+**find**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pattern` | string | yes | Glob pattern to match |
+| `path` | string | no | Search directory (default: `.`) |
+| `type` | string | no | `f` for files, `d` for directories |
+
+**ls**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | no | Directory to list (default: `.`) |
+
+</details>
+
 ### Sessions (`session.rs`)
 
-Every conversation is automatically saved to `~/.agent-runtime/sessions/`. Session files are JSON containing the full API message history, model settings, token counts, and cost.
+Every conversation is automatically saved to `~/.SynapsCLI/sessions/`. Session files are JSON containing the full API message history, model settings, token counts, and cost. Empty sessions (no user messages) are not saved.
+
+Session ID format: `YYYYMMDD-HHMMSS-XXXX` (4-character UUID suffix).
+
+Sessions are automatically titled from the first 80 characters of the first user message.
 
 ```bash
-# Continue the most recent session
+# Continue the most recent session (no ID needed)
 cargo run --bin chatui -- --continue
 
 # Continue a specific session (partial ID match)
@@ -133,41 +215,14 @@ Session functions:
 
 - `Session::new()` — Create with current model/thinking/system prompt
 - `Session::save()` / `Session::load()` — Persist to / read from disk
+- `Session::auto_title()` — Set title from first user message
 - `list_sessions()` — All sessions sorted by last updated
 - `latest_session()` — Most recently active session
-- `find_session("partial_id")` — Fuzzy match by ID substring
+- `find_session("partial_id")` — Exact match first, then substring match. Errors on ambiguous matches.
 
 ### TUI (`chatui.rs`)
 
 The terminal interface built with ratatui, crossterm, tachyonfx, and syntect.
-
-**Layout:**
-
-```
-┌─ agent-runtime │ streaming ──────────────────────────┐
-│                                                       │
-│  ● You                                        14:32   │
-│    show me the project structure                      │
-│                                                       │
-│  … thinking                                           │
-│    analyzing the directory layout...                  │
-│                                                       │
-│  ● Agent                                      14:32   │
-│    Here's the structure:                              │
-│    ── rust ──                                         │
-│    │ fn main() { ... }                                │
-│                                                       │
-│  ❯ bash                                               │
-│    command │ ls -la src/                               │
-│    │ total 48                                         │
-│    │ -rw-r--r-- 1 user 1234 lib.rs                    │
-│                                                       │
-├───────────────────────────────────────────────────────┤
-│ ❯ type a message                                      │
-├───────────────────────────────────────────────────────┤
-│ ctrl+c quit  esc abort    $0.0312 1.2kin 3.4kout  ... │
-└───────────────────────────────────────────────────────┘
-```
 
 **Keyboard shortcuts:**
 
@@ -182,41 +237,53 @@ The terminal interface built with ratatui, crossterm, tachyonfx, and syntect.
 | `Ctrl+U` | Delete to start of line |
 | `Alt+Left` / `Alt+Right` | Move cursor by word |
 | `Alt+Backspace` | Delete word backward |
-| `Up` / `Down` | Input history |
-| `Shift+Up` / `Shift+Down` | Scroll messages |
+| `Up` / `Down` | Input history navigation |
+| `Shift+Up` / `Shift+Down` | Scroll message history |
 | `Mouse wheel` | Scroll messages (3 lines per tick) |
-| `Tab` | Autocomplete slash commands |
+| `Tab` | Autocomplete slash commands (longest common prefix) |
 
 **Slash commands:**
 
+Commands support unambiguous prefix matching — `/q` resolves to `/quit`, `/s` is ambiguous (sessions/system) so it won't resolve, but `/se` resolves to `/sessions`.
+
 | Command | Description |
 |---------|-------------|
-| `/clear` | Reset conversation |
+| `/clear` | Save current session and start a new one |
 | `/model [name]` | Show or set model |
 | `/system <prompt\|show\|save>` | Manage system prompt |
 | `/thinking [low\|medium\|high\|xhigh]` | Set thinking budget |
-| `/sessions` | List saved sessions |
-| `/resume <id>` | Switch to a different session |
+| `/sessions` | List saved sessions (up to 20, with active marker) |
+| `/resume <id>` | Save current session and switch to another |
 | `/help` | Show available commands |
 | `/quit` | Exit |
+| `/exit` | Exit (alias for `/quit`) |
 
 **Rendering:**
 
 - Markdown: headings, bold, italic, inline code, blockquotes, ordered/unordered lists
 - Code blocks: syntax highlighted via syntect (base16-ocean.dark theme)
-- Tool calls: per-tool icons (❯ bash, ▷ read, ◁ write, Δ edit, ⌕ grep, ⌂ find, ≡ ls)
-- Tool results: smart truncation, error results in red
-- Animations: fade-in on boot (300ms), dissolve on exit (800ms) via tachyonfx
+- Tool calls: per-tool icons (❯ bash, ▸ read, ◂ write, Δ edit, ⌕ grep, ○ find, ≡ ls)
+- Tool results: compact "└─ ok (N lines)" summary with indented output, errors in red
+- Thinking: dimmed with │ left border, truncated to 6 lines
+- Animations: fade-in on boot (300ms, QuadOut), dissolve on exit (800ms, QuadIn) via tachyonfx
+
+**Theme:**
+
+Dark base (RGB 12,14,18) with teal accents (RGB 80,200,160). User messages have a subtle background highlight. The color palette is designed for high contrast on dark terminals.
 
 ## Configuration
 
 ### Config file
 
-`~/.agent-runtime/config` — key=value format:
+`~/.SynapsCLI/config` — key=value format, supports `#` comments:
 
 ```
+# Model selection
 model = claude-opus-4-6
+
+# Thinking budget (named level or raw token count)
 thinking = xhigh
+# thinking = 8192
 ```
 
 **Thinking levels:**
@@ -227,17 +294,18 @@ thinking = xhigh
 | `medium` | 4,096 |
 | `high` | 16,384 |
 | `xhigh` | 32,768 |
+| `<number>` | Custom token count |
 
 ### System prompt
 
-`~/.agent-runtime/system.md` — loaded on startup. Can also be set at runtime with `/system`.
+`~/.SynapsCLI/system.md` — loaded on startup. Can also be set at runtime with `/system`.
+
+Default (when no file exists):
+> You are a helpful AI agent running in a terminal. You have access to bash, read, and write tools. Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.
 
 ### Authentication
 
-The runtime checks for credentials in order:
-
-1. **OAuth** — `~/.pi/agent/auth.json` (if present with valid access token)
-2. **API key** — `ANTHROPIC_API_KEY` environment variable
+Set `ANTHROPIC_API_KEY` in your environment. The runtime sends it via the `x-api-key` header with `anthropic-version: 2023-06-01`.
 
 ## Cost Tracking
 
@@ -248,6 +316,8 @@ Session cost is calculated per API call using current Anthropic pricing:
 | Opus | $15.00 | $75.00 |
 | Sonnet | $3.00 | $15.00 |
 | Haiku | $0.80 | $4.00 |
+
+Model matching is substring-based (e.g. any model ID containing "opus" uses Opus pricing). Unknown models default to Sonnet pricing.
 
 The running total is displayed in the footer and persisted with each session.
 
@@ -261,11 +331,11 @@ The running total is displayed in the footer and persisted with each session.
 | clap | CLI argument parsing |
 | ratatui | Terminal UI framework |
 | crossterm | Terminal backend + input events |
-| tachyonfx | Terminal animations |
-| syntect | Syntax highlighting |
+| tachyonfx | Terminal animations (fade-in, dissolve) |
+| syntect | Syntax highlighting for code blocks |
 | chrono | Timestamps |
 | uuid | Session ID generation |
-| tokio-util | CancellationToken |
+| tokio-util | CancellationToken for streaming abort |
 | thiserror | Error derive macros |
 
 ## License

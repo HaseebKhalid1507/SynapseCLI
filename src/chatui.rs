@@ -1,4 +1,4 @@
-use agent_runtime::{Runtime, StreamEvent, Result, CancellationToken, Session, list_sessions, latest_session, find_session};
+use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, list_sessions, latest_session, find_session};
 use clap::Parser;
 use crossterm::{
     event::{Event, KeyCode, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture, EventStream},
@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Alignment},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, Paragraph, Padding},
+    widgets::{Block, Borders, BorderType, Clear, Paragraph, Padding},
     Terminal,
 };
 use serde_json::{json, Value};
@@ -27,36 +27,38 @@ use syntect::util::LinesWithEndings;
 // -- Theme -------------------------------------------------------------------
 
 // Markdown
-const CODE_FG: Color = Color::Rgb(200, 160, 100);
-const CODE_BG: Color = Color::Rgb(30, 30, 40);
-const HEADING_COLOR: Color = Color::Rgb(160, 190, 240);
-const QUOTE_COLOR: Color = Color::Rgb(130, 130, 160);
-const LIST_BULLET_COLOR: Color = Color::Rgb(120, 210, 160);
+const CODE_FG: Color = Color::Rgb(180, 210, 160);
+const CODE_BG: Color = Color::Rgb(22, 26, 30);
+const HEADING_COLOR: Color = Color::Rgb(140, 220, 200);
+const QUOTE_COLOR: Color = Color::Rgb(100, 110, 130);
+const LIST_BULLET_COLOR: Color = Color::Rgb(80, 200, 160);
 
 // Base
-const BG: Color = Color::Rgb(18, 18, 24);
-const BORDER: Color = Color::Rgb(58, 58, 78);
-const BORDER_ACTIVE: Color = Color::Rgb(110, 140, 200);
-const MUTED: Color = Color::Rgb(90, 90, 110);
+const BG: Color = Color::Rgb(12, 14, 18);
+const BORDER: Color = Color::Rgb(35, 40, 50);
+const BORDER_ACTIVE: Color = Color::Rgb(80, 180, 150);
+const MUTED: Color = Color::Rgb(55, 62, 75);
 
 // Messages
-const USER_COLOR: Color = Color::Rgb(130, 170, 255);
-const USER_BG: Color = Color::Rgb(30, 35, 50);
-const CLAUDE_LABEL: Color = Color::Rgb(120, 210, 160);
-const CLAUDE_TEXT: Color = Color::Rgb(210, 210, 220);
-const THINKING_COLOR: Color = Color::Rgb(90, 90, 110);
-const TOOL_LABEL: Color = Color::Rgb(220, 180, 90);
-const TOOL_PARAM: Color = Color::Rgb(170, 155, 110);
-const TOOL_RESULT_COLOR: Color = Color::Rgb(100, 140, 100);
-const ERROR_COLOR: Color = Color::Rgb(230, 90, 90);
+const USER_COLOR: Color = Color::Rgb(190, 200, 220);
+const USER_BG: Color = Color::Rgb(20, 24, 32);
+const CLAUDE_LABEL: Color = Color::Rgb(80, 200, 160);
+const CLAUDE_TEXT: Color = Color::Rgb(195, 200, 210);
+const THINKING_COLOR: Color = Color::Rgb(65, 75, 95);
+const TOOL_LABEL: Color = Color::Rgb(100, 180, 220);
+const TOOL_PARAM: Color = Color::Rgb(80, 110, 140);
+const TOOL_RESULT_COLOR: Color = Color::Rgb(65, 130, 100);
+const TOOL_RESULT_OK: Color = Color::Rgb(60, 160, 110);
+const ERROR_COLOR: Color = Color::Rgb(220, 80, 80);
 
 // UI
-const HEADER_FG: Color = Color::Rgb(160, 160, 180);
-const STATUS_STREAMING: Color = Color::Rgb(220, 180, 90);
-const STATUS_READY: Color = Color::Rgb(100, 180, 120);
-const HELP_FG: Color = Color::Rgb(70, 70, 90);
-const INPUT_FG: Color = Color::Rgb(200, 200, 210);
-const PROMPT_FG: Color = Color::Rgb(110, 140, 200);
+const HEADER_FG: Color = Color::Rgb(120, 130, 150);
+const STATUS_STREAMING: Color = Color::Rgb(220, 170, 70);
+const STATUS_READY: Color = Color::Rgb(80, 200, 160);
+const HELP_FG: Color = Color::Rgb(50, 58, 70);
+const INPUT_FG: Color = Color::Rgb(190, 195, 205);
+const PROMPT_FG: Color = Color::Rgb(80, 180, 150);
+const SEPARATOR: Color = Color::Rgb(30, 35, 45);
 
 // -- Data --------------------------------------------------------------------
 
@@ -205,136 +207,134 @@ impl App {
 
     fn render_lines(&self, width: usize) -> Vec<Line<'_>> {
         let mut lines: Vec<Line> = Vec::new();
-        let indent = "  ";
-        let w = width.saturating_sub(2); // account for indent
+        let m = "   "; // margin
 
-        for tmsg in &self.messages {
+        for (i, tmsg) in self.messages.iter().enumerate() {
             let ts = &tmsg.time;
             match &tmsg.msg {
                 ChatMessage::User(text) => {
-                    let bg_style = Style::default().bg(USER_BG);
+                    let bg = Style::default().bg(USER_BG);
+                    // Top margin
+                    lines.push(Line::from(""));
                     // Top padding
-                    lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg_style)));
-                    // Label line with timestamp
-                    let label = format!("{}  \u{25cf} You", indent);
-                    let ts_str = format!(" {} ", ts);
-                    let label_chars = label.chars().count();
-                    let ts_chars = ts_str.chars().count();
-                    let gap = width.saturating_sub(label_chars + ts_chars);
-                    let padded = format!("{}{}", label, " ".repeat(gap));
+                    lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
+                    // Header: chevron + name + timestamp right-aligned
+                    let label = format!("{}\u{276f} you", m);
+                    let ts_str = format!("{} ", ts);
+                    let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
                     lines.push(Line::from(vec![
-                        Span::styled(padded, Style::default().fg(USER_COLOR).bg(USER_BG).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format!("{}{}", label, " ".repeat(gap)),
+                            Style::default().fg(USER_COLOR).bg(USER_BG).add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(ts_str, Style::default().fg(MUTED).bg(USER_BG)),
                     ]));
                     // Content
                     let style = Style::default().fg(USER_COLOR).bg(USER_BG);
                     for line in text.lines() {
-                        for wline in wrap_text(&format!("{}    {}", indent, line), width) {
-                            let padded = format!("{:<width$}", wline, width = width);
-                            lines.push(Line::from(Span::styled(padded, style)));
+                        for wline in wrap_text(&format!("{}  {}", m, line), width) {
+                            lines.push(Line::from(Span::styled(
+                                format!("{:<width$}", wline, width = width), style,
+                            )));
                         }
                     }
                     // Bottom padding
-                    lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg_style)));
+                    lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
+                    // Bottom margin
+                    lines.push(Line::from(""));
                 }
+
                 ChatMessage::Thinking(text) => {
-                    // Thin left border style for thinking
-                    let border_style = Style::default().fg(THINKING_COLOR);
-                    let text_style = Style::default().fg(THINKING_COLOR).add_modifier(Modifier::ITALIC);
+                    let dim = Style::default().fg(THINKING_COLOR);
+                    let dim_italic = dim.add_modifier(Modifier::ITALIC);
+                    // Header
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{}  \u{2502} ", indent), border_style),
-                        Span::styled("thinking\u{2026}", Style::default().fg(THINKING_COLOR).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{}\u{2502} ", m), dim),
+                        Span::styled("thinking", dim.add_modifier(Modifier::DIM)),
                     ]));
-                    let thinking_lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-                    let show = thinking_lines.len().min(6);
-                    for line in &thinking_lines[..show] {
-                        for wline in wrap_text(&format!("{}  \u{2502}   {}", indent, line.trim()), width) {
-                            lines.push(Line::from(Span::styled(wline, text_style)));
+                    // Body — filtered, capped
+                    let tlines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                    let show = tlines.len().min(6);
+                    for line in &tlines[..show] {
+                        for wline in wrap_text(&format!("{}\u{2502}  {}", m, line.trim()), width) {
+                            lines.push(Line::from(Span::styled(wline, dim_italic)));
                         }
                     }
-                    if thinking_lines.len() > 6 {
+                    if tlines.len() > 6 {
                         lines.push(Line::from(Span::styled(
-                            format!("{}  \u{2502}   [{} more lines]", indent, thinking_lines.len() - 6),
-                            border_style,
+                            format!("{}\u{2502}  +{} lines", m, tlines.len() - 6), dim,
                         )));
                     }
-                    lines.push(Line::from(Span::styled(
-                        format!("{}  \u{2502}", indent),
-                        border_style,
-                    )));
                 }
+
                 ChatMessage::Text(text) => {
-                    let agent_label = format!("{}\u{25cf} Agent", indent);
-                    let ts_str = format!(" {} ", ts);
-                    let label_chars = agent_label.chars().count();
-                    let ts_chars = ts_str.chars().count();
-                    let gap = width.saturating_sub(label_chars + ts_chars);
-                    let padded = format!("{}{}", agent_label, " ".repeat(gap));
+                    // Separator between user block and agent response
+                    if i > 0 {
+                        let sep: String = "\u{2500}".repeat(width.min(40));
+                        lines.push(Line::from(Span::styled(
+                            format!("{}{}", m, sep), Style::default().fg(SEPARATOR),
+                        )));
+                    }
+                    // Header
+                    let label = format!("{}\u{25c8} agent", m);
+                    let ts_str = format!("{} ", ts);
+                    let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
                     lines.push(Line::from(vec![
-                        Span::styled(padded, Style::default().fg(CLAUDE_LABEL).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format!("{}{}", label, " ".repeat(gap)),
+                            Style::default().fg(CLAUDE_LABEL).add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(ts_str, Style::default().fg(MUTED)),
                     ]));
+                    // Body
                     if text.is_empty() {
                         lines.push(Line::from(Span::styled(
-                            format!("{}  ...", indent),
-                            Style::default().fg(MUTED),
+                            format!("{}   \u{2026}", m), Style::default().fg(MUTED),
                         )));
                     } else {
-                        lines.extend(render_markdown(text, indent, width));
+                        lines.extend(render_markdown(text, m, width));
                     }
                 }
+
                 ChatMessage::ToolUse { tool_name, input } => {
-                    lines.push(Line::from(""));
-                    // Tool icon based on type
+                    // Compact tool header
                     let icon = match tool_name.as_str() {
-                        "bash" => "\u{276f}",    // ❯
-                        "read" => "\u{25b7}",    // ▷
-                        "write" => "\u{25c1}",   // ◁
-                        "edit" => "\u{0394}",    // Δ
-                        "grep" => "\u{2315}",    // ⌕
-                        "find" => "\u{2302}",    // ⌂
-                        "ls" => "\u{2261}",      // ≡
-                        _ => "\u{2192}",         // →
+                        "bash"  => "\u{276f}",
+                        "read"  => "\u{25b8}",
+                        "write" => "\u{25c2}",
+                        "edit"  => "\u{0394}",
+                        "grep"  => "\u{2315}",
+                        "find"  => "\u{25cb}",
+                        "ls"    => "\u{2261}",
+                        _       => "\u{2192}",
                     };
-                    lines.push(Line::from(Span::styled(
-                        format!("{}  {} {}", indent, icon, tool_name),
-                        Style::default().fg(TOOL_LABEL).add_modifier(Modifier::BOLD),
-                    )));
-                    // Parse and show params — compact for simple tools
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(TOOL_LABEL)),
+                        Span::styled(tool_name.clone(), Style::default().fg(TOOL_LABEL).add_modifier(Modifier::BOLD)),
+                    ]));
+                    // Params — key:value on one line each, dimmed
                     let param_style = Style::default().fg(TOOL_PARAM);
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
                         if let Some(obj) = parsed.as_object() {
                             for (k, v) in obj {
                                 let val = match v.as_str() {
-                                    Some(s) => {
-                                        // Truncate very long values (e.g. file content in write)
-                                        if s.len() > 200 {
-                                            let preview: String = s.chars().take(200).collect();
-                                            format!("{}...", preview)
-                                        } else {
-                                            s.to_string()
-                                        }
+                                    Some(s) if s.len() > 120 => {
+                                        let p: String = s.chars().take(120).collect();
+                                        format!("{}\u{2026}", p)
                                     }
+                                    Some(s) => s.to_string(),
                                     None => v.to_string(),
                                 };
-                                let param = format!("{}    {} \u{2502} {}", indent, k, val);
-                                for wline in wrap_text(&param, width) {
+                                let line_str = format!("{}     {}: {}", m, k, val);
+                                for wline in wrap_text(&line_str, width) {
                                     lines.push(Line::from(Span::styled(wline, param_style)));
                                 }
                             }
-                        } else {
-                            for wline in wrap_text(&format!("{}    {}", indent, input), w) {
-                                lines.push(Line::from(Span::styled(wline, param_style)));
-                            }
-                        }
-                    } else {
-                        for wline in wrap_text(&format!("{}    {}", indent, input), w) {
-                            lines.push(Line::from(Span::styled(wline, param_style)));
                         }
                     }
                 }
+
                 ChatMessage::ToolResult(result) => {
-                    // Determine if result looks like a success or failure
                     let is_error = result.starts_with("Tool execution failed")
                         || result.starts_with("Unknown tool");
                     let style = if is_error {
@@ -343,42 +343,44 @@ impl App {
                         Style::default().fg(TOOL_RESULT_COLOR)
                     };
 
-                    // Smart truncation: show more lines for code/file reads, fewer for noise
-                    let max_lines = if result.lines().count() > 30 { 15 } else { 12 };
                     let result_lines: Vec<&str> = result.lines().collect();
-                    let show = result_lines.len().min(max_lines);
+                    let max_show = if result_lines.len() > 30 { 15 } else { 12 };
+                    let show = result_lines.len().min(max_show);
+
+                    // Success/fail indicator
+                    if !is_error && show > 0 {
+                        lines.push(Line::from(Span::styled(
+                            format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
+                            Style::default().fg(TOOL_RESULT_OK),
+                        )));
+                    }
 
                     for line in &result_lines[..show] {
-                        let full = format!("{}    \u{2502} {}", indent, line);
+                        let full = format!("{}       {}", m, line);
                         for wline in wrap_text(&full, width) {
                             lines.push(Line::from(Span::styled(wline, style)));
                         }
                     }
                     if result_lines.len() > show {
                         lines.push(Line::from(Span::styled(
-                            format!("{}    \u{2502} [{} more lines]", indent, result_lines.len() - show),
+                            format!("{}       +{} lines", m, result_lines.len() - show),
                             Style::default().fg(MUTED),
                         )));
                     }
                 }
+
                 ChatMessage::Error(err) => {
-                    lines.push(Line::from(""));
-                    let full = format!("{}  \u{2716} {}", indent, err);
-                    for wline in wrap_text(&full, width) {
-                        lines.push(Line::from(Span::styled(
-                            wline,
-                            Style::default().fg(ERROR_COLOR),
-                        )));
-                    }
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}  \u{2718} ", m), Style::default().fg(ERROR_COLOR)),
+                        Span::styled(err.clone(), Style::default().fg(ERROR_COLOR)),
+                    ]));
                 }
+
                 ChatMessage::System(msg) => {
-                    let full = format!("{}  \u{2022} {}", indent, msg);
-                    for wline in wrap_text(&full, width) {
-                        lines.push(Line::from(Span::styled(
-                            wline,
-                            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-                        )));
-                    }
+                    lines.push(Line::from(Span::styled(
+                        format!("{}  {}", m, msg),
+                        Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                    )));
                 }
             }
         }
@@ -679,12 +681,13 @@ fn draw(
 
         // -- Header ----------------------------------------------------------
         let status_span = if app.streaming {
-            Span::styled(" streaming ", Style::default().fg(STATUS_STREAMING))
+            Span::styled(" \u{25cf} streaming ", Style::default().fg(STATUS_STREAMING))
         } else {
-            Span::styled(" ready ", Style::default().fg(STATUS_READY))
+            Span::styled(" \u{25cb} ready ", Style::default().fg(STATUS_READY))
         };
         let header = Paragraph::new(Line::from(vec![
-            Span::styled(" agent-runtime ", Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD)),
+            Span::styled("  Synaps", Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD)),
+            Span::styled("CLI ", Style::default().fg(MUTED)),
             Span::styled("\u{2502}", Style::default().fg(BORDER)),
             status_span,
         ]))
@@ -703,11 +706,12 @@ fn draw(
         let visible: Vec<Line> = all_lines[start..end].to_vec();
 
         let msg_block = Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP | Borders::BOTTOM)
             .border_type(BorderType::Plain)
             .border_style(Style::default().fg(BORDER))
             .padding(Padding::horizontal(1));
         let messages_widget = Paragraph::new(visible).block(msg_block);
+        frame.render_widget(Clear, msg_area);
         frame.render_widget(messages_widget, msg_area);
 
         // Scroll indicator
@@ -731,7 +735,7 @@ fn draw(
         let input_border_color = if app.streaming { BORDER } else { BORDER_ACTIVE };
         let input_block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(input_border_color))
             .style(Style::default().bg(BG));
         let input_widget = Paragraph::new(Line::from(vec![
@@ -847,7 +851,7 @@ fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
 }
 
 #[derive(Parser)]
-#[command(name = "chatui", about = "Terminal chat UI for agent-runtime")]
+#[command(name = "chatui", about = "Terminal chat UI for SynapsCLI")]
 struct Cli {
     /// Continue a previous session. Optionally provide a session ID (partial match supported).
     #[arg(long = "continue", value_name = "SESSION_ID")]
@@ -859,9 +863,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut runtime = Runtime::new().await?;
 
-    // Load config from ~/.agent-runtime/
+    // Load config from ~/.synaps-cli/
     let config_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".agent-runtime");
+        .join(".synaps-cli");
     let config_path = config_dir.join("config");
 
     // Parse config file (key=value, one per line)
@@ -895,7 +899,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Load system prompt: ~/.agent-runtime/system.md > default
+    // Load system prompt: ~/.synaps-cli/system.md > default
     let system_prompt_path = config_dir.join("system.md");
     let system_prompt = if system_prompt_path.exists() {
         std::fs::read_to_string(&system_prompt_path)

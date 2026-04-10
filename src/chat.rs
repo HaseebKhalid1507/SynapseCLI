@@ -1,4 +1,4 @@
-use agent_runtime::{Runtime, StreamEvent, Result, CancellationToken};
+use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::io::{self, Write};

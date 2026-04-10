@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use agent_runtime::{Runtime, Result};
+use synaps_cli::{Runtime, Result};
 use std::io::{self, Write};
 
 #[derive(Parser)]
