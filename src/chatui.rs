@@ -311,6 +311,7 @@ fn draw(
     model: &str,
     thinking: &str,
     effect: &mut Option<Effect>,
+    exit_effect: &mut Option<Effect>,
     elapsed: std::time::Duration,
 ) -> io::Result<()> {
     terminal.draw(|frame| {
@@ -436,6 +437,10 @@ fn draw(
                 *effect = None;
             }
         }
+        if let Some(ref mut fx) = exit_effect {
+            let area = frame.area();
+            fx.process(elapsed.into(), frame.buffer_mut(), area);
+        }
     })?;
     Ok(())
 }
@@ -462,6 +467,7 @@ async fn main() -> Result<()> {
     let mut boot_fx: Option<Effect> = Some(
         fx::fade_from_fg(Color::Black, (300, Interpolation::QuadOut))
     );
+    let mut exit_fx: Option<Effect> = None;
     let mut last_frame = Instant::now();
 
     loop {
@@ -471,18 +477,23 @@ async fn main() -> Result<()> {
 
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
-        draw(&mut terminal, &app, runtime.model(), runtime.thinking_level(), &mut boot_fx, elapsed).unwrap();
+        draw(&mut terminal, &app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
 
         tokio::select! {
             // Tick to keep redrawing during animations
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() => {
+                if exit_fx.as_ref().map_or(false, |fx| fx.done()) {
+                    break;
+                }
                 continue;
             }
             maybe_event = event_reader.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) => {
                         match (key.code, key.modifiers) {
-                            (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) if exit_fx.is_none() => {
+                                exit_fx = Some(fx::dissolve((800, Interpolation::QuadIn)));
+                            }
                             (KeyCode::Esc, _) if app.streaming => {
                                 stream = None;
                                 app.streaming = false;
@@ -545,7 +556,9 @@ async fn main() -> Result<()> {
                                                 "/help — show this".to_string()
                                             ));
                                         }
-                                        "quit" | "exit" => break,
+                                        "quit" | "exit" => {
+                                            exit_fx = Some(fx::dissolve((800, Interpolation::QuadIn)));
+                                        }
                                         _ => {
                                             app.messages.push(ChatMessage::Error(
                                                 format!("unknown command: /{}", cmd)
