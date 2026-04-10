@@ -34,9 +34,9 @@ cargo build --release
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # Or create a config
-mkdir -p ~/.SynapsCLI
-echo "model = claude-sonnet-4-20250514" > ~/.SynapsCLI/config
-echo "thinking = medium" >> ~/.SynapsCLI/config
+mkdir -p ~/.synaps-cli
+echo "model = claude-opus-4-6" > ~/.synaps-cli/config
+echo "thinking = medium" >> ~/.synaps-cli/config
 ```
 
 ### Run
@@ -44,6 +44,10 @@ echo "thinking = medium" >> ~/.SynapsCLI/config
 ```bash
 # TUI mode (recommended)
 cargo run --bin chatui
+
+# With a custom system prompt (string or file path)
+cargo run --bin chatui -- --system "You are a Rust expert."
+cargo run --bin chatui -- -s ./prompts/coding.md
 
 # Continue the most recent session
 cargo run --bin chatui -- --continue
@@ -55,7 +59,7 @@ cargo run --bin chatui -- --continue 20260410-1430
 cargo run --bin chat
 
 # Single prompt (non-streaming)
-cargo run --bin SynapsCLI run "explain quicksort"
+cargo run --bin synaps-cli run "explain quicksort"
 ```
 
 ## Architecture
@@ -85,7 +89,7 @@ Public API:
 
 ```rust
 let runtime = Runtime::new().await?;
-runtime.set_model("claude-sonnet-4-20250514".to_string());
+runtime.set_model("claude-opus-4-6".to_string());
 runtime.set_thinking_budget(16384);
 runtime.set_system_prompt("You are a helpful agent.".to_string());
 
@@ -197,7 +201,7 @@ All tools expand `~` to `$HOME`. Tool results are streamed back to the TUI as th
 
 ### Sessions (`session.rs`)
 
-Every conversation is automatically saved to `~/.SynapsCLI/sessions/`. Session files are JSON containing the full API message history, model settings, token counts, and cost. Empty sessions (no user messages) are not saved.
+Every conversation is automatically saved to `~/.synaps-cli/sessions/`. Session files are JSON containing the full API message history, model settings, token counts, and cost. Empty sessions (no user messages) are not saved.
 
 Session ID format: `YYYYMMDD-HHMMSS-XXXX` (4-character UUID suffix).
 
@@ -275,7 +279,7 @@ Dark base (RGB 12,14,18) with teal accents (RGB 80,200,160). User messages have 
 
 ### Config file
 
-`~/.SynapsCLI/config` — key=value format, supports `#` comments:
+`~/.synaps-cli/config` — key=value format, supports `#` comments:
 
 ```
 # Model selection
@@ -298,9 +302,15 @@ thinking = xhigh
 
 ### System prompt
 
-`~/.SynapsCLI/system.md` — loaded on startup. Can also be set at runtime with `/system`.
+Loaded in priority order:
 
-Default (when no file exists):
+1. `--system` / `-s` CLI flag (string or file path — auto-detected)
+2. `~/.synaps-cli/system.md` file
+3. Built-in default
+
+Can also be changed at runtime with `/system`.
+
+Default (when no flag or file exists):
 > You are a helpful AI agent running in a terminal. You have access to bash, read, and write tools. Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.
 
 ### Authentication
