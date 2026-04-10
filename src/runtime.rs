@@ -64,7 +64,7 @@ impl Runtime {
             client: Client::new(),
             auth_token,
             auth_type,
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-opus-4-6".to_string(),
             tools: ToolRegistry::new(),
             system_prompt: None,
             thinking_budget: 4096,

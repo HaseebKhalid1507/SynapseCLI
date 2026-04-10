@@ -856,6 +856,10 @@ struct Cli {
     /// Continue a previous session. Optionally provide a session ID (partial match supported).
     #[arg(long = "continue", value_name = "SESSION_ID")]
     continue_session: Option<Option<String>>,
+
+    /// System prompt: a string or a path to a file.
+    #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
+    system: Option<String>,
 }
 
 #[tokio::main]
@@ -899,9 +903,16 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Load system prompt: ~/.synaps-cli/system.md > default
+    // Load system prompt: --system flag > ~/.synaps-cli/system.md > default
     let system_prompt_path = config_dir.join("system.md");
-    let system_prompt = if system_prompt_path.exists() {
+    let system_prompt = if let Some(ref val) = cli.system {
+        let path = std::path::Path::new(val);
+        if path.exists() && path.is_file() {
+            std::fs::read_to_string(path).unwrap_or_else(|_| val.clone())
+        } else {
+            val.clone()
+        }
+    } else if system_prompt_path.exists() {
         std::fs::read_to_string(&system_prompt_path)
             .unwrap_or_default()
     } else {
@@ -1340,6 +1351,10 @@ async fn main() -> Result<()> {
                             app.api_messages.pop();
                         }
                     }
+                    // Redraw immediately so tool calls appear before execution
+                    let elapsed = last_frame.elapsed();
+                    last_frame = Instant::now();
+                    draw(&mut terminal, &app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
                 }
             }
         }
