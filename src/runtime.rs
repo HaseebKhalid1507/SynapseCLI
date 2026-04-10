@@ -294,12 +294,10 @@ impl Runtime {
                         continue;
                     }
 
-                    // Send tool use event
-                    let _ = tx.send(StreamEvent::ToolUse {
-                        tool_name: tool_name.clone(),
-                        tool_id: tool_id.clone(),
-                        input: input.clone(),
-                    });
+                    // Note: StreamEvent::ToolUse is already emitted inside call_api_stream
+                    // the moment the tool_use content block closes, so the UI can render
+                    // the call as part of the assistant's stream instead of only just
+                    // before the result lands.
 
                     let result = match self.tools.get(&tool_name) {
                         Some(tool) => {
@@ -533,6 +531,16 @@ impl Runtime {
                                 "input": input
                             }));
 
+                            // Emit the tool_use to the UI as soon as it's fully parsed,
+                            // so the call appears during the assistant's stream — before
+                            // we hand off to the tool executor. Without this the call
+                            // only becomes visible immediately prior to its result.
+                            let _ = tx.send(StreamEvent::ToolUse {
+                                tool_name: current_tool_name.clone(),
+                                tool_id: current_tool_id.clone(),
+                                input: input.clone(),
+                            });
+
                             in_tool_use = false;
                         } else if !current_text.is_empty() {
                             // Flush text block so ordering is preserved
@@ -590,10 +598,15 @@ impl Runtime {
                             };
                             accumulated_content.push(json!({
                                 "type": "tool_use",
-                                "id": current_tool_id,
-                                "name": current_tool_name,
-                                "input": input
+                                "id": current_tool_id.clone(),
+                                "name": current_tool_name.clone(),
+                                "input": input.clone()
                             }));
+                            let _ = tx.send(StreamEvent::ToolUse {
+                                tool_name: current_tool_name.clone(),
+                                tool_id: current_tool_id.clone(),
+                                input,
+                            });
                         }
                     }
                 }
