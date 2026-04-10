@@ -24,7 +24,13 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+use std::sync::LazyLock;
+
 // -- Theme -------------------------------------------------------------------
+
+// Syntect loaded once, reused forever
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| SyntaxSet::load_defaults_newlines());
+static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(|| ThemeSet::load_defaults());
 
 // Markdown
 const CODE_FG: Color = Color::Rgb(180, 210, 160);
@@ -96,6 +102,9 @@ struct App {
     total_output_tokens: u64,
     session_cost: f64,
     session: Session,
+    line_cache: Vec<Line<'static>>,
+    cache_width: usize,
+    dirty: bool,
 }
 
 impl App {
@@ -116,6 +125,9 @@ impl App {
             total_output_tokens: 0,
             session_cost: 0.0,
             session,
+            line_cache: Vec::new(),
+            cache_width: 0,
+            dirty: true,
         }
     }
 
@@ -154,6 +166,7 @@ impl App {
             msg,
             time: Local::now().format("%H:%M").to_string(),
         });
+        self.dirty = true;
     }
 
     fn history_up(&mut self) {
@@ -195,6 +208,7 @@ impl App {
         } else {
             self.push_msg(ChatMessage::Text(text.to_string()));
         }
+        self.dirty = true;
     }
 
     fn append_or_update_thinking(&mut self, text: &str) {
@@ -203,9 +217,10 @@ impl App {
         } else {
             self.push_msg(ChatMessage::Thinking(text.to_string()));
         }
+        self.dirty = true;
     }
 
-    fn render_lines(&self, width: usize) -> Vec<Line<'_>> {
+    fn render_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines: Vec<Line> = Vec::new();
         let m = "   "; // margin
 
@@ -449,9 +464,9 @@ fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static>> {
 }
 
 /// Highlight a code block using syntect
-fn highlight_code_block<'a>(code: &str, lang: &str, prefix: &str) -> Vec<Line<'a>> {
-    let ss = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
+fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'static>> {
+    let ss = &*SYNTAX_SET;
+    let ts = &*THEME_SET;
     let theme = &ts.themes["base16-ocean.dark"];
 
     let syntax = ss.find_syntax_by_token(lang)
@@ -480,7 +495,7 @@ fn highlight_code_block<'a>(code: &str, lang: &str, prefix: &str) -> Vec<Line<'a
 }
 
 /// Render markdown text into Lines, handling code blocks, headings, lists, quotes
-fn render_markdown<'a>(text: &str, prefix: &str, width: usize) -> Vec<Line<'a>> {
+fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     let base_style = Style::default().fg(CLAUDE_TEXT);
     let mut in_code_block = false;
@@ -661,7 +676,7 @@ fn format_tokens(n: u64) -> String {
 
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &App,
+    app: &mut App,
     model: &str,
     thinking: &str,
     effect: &mut Option<Effect>,
@@ -699,7 +714,14 @@ fn draw(
         let content_height = msg_area.height.saturating_sub(2) as usize;
         let content_width = msg_area.width.saturating_sub(4) as usize; // borders + padding
 
-        let all_lines = app.render_lines(content_width);
+        // Rebuild line cache only when content changed or width changed
+        if app.dirty || app.cache_width != content_width {
+            app.line_cache = app.render_lines(content_width);
+            app.cache_width = content_width;
+            app.dirty = false;
+        }
+
+        let all_lines = &app.line_cache;
         let total = all_lines.len();
         let end = total.saturating_sub(app.scroll_back as usize);
         let start = end.saturating_sub(content_height);
@@ -973,7 +995,7 @@ async fn main() -> Result<()> {
     loop {
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
-        draw(&mut terminal, &app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+        draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
 
         tokio::select! {
             // Tick to keep redrawing during animations
@@ -1028,6 +1050,7 @@ async fn main() -> Result<()> {
                                         "clear" => {
                                             app.save_session();
                                             app.messages.clear();
+                                            app.dirty = true;
                                             app.api_messages.clear();
                                             app.total_input_tokens = 0;
                                             app.total_output_tokens = 0;
@@ -1133,6 +1156,7 @@ async fn main() -> Result<()> {
                                                         let old_id = app.session.id.clone();
                                                         // Rebuild app state from loaded session
                                                         app.messages.clear();
+                                            app.dirty = true;
                                                         app.api_messages = session.api_messages.clone();
                                                         app.total_input_tokens = session.total_input_tokens;
                                                         app.total_output_tokens = session.total_output_tokens;
@@ -1367,7 +1391,7 @@ async fn main() -> Result<()> {
                     // Redraw immediately so tool calls appear before execution
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
-                    draw(&mut terminal, &app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+                    draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
                 }
             }
         }
