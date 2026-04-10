@@ -25,6 +25,13 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tachyonfx = "0.9"
 syntect = { version = "5", default-features = false, features = ["default-themes", "default-syntaxes", "regex-onig"] }
 
+# Server deps
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
 [[bin]]
 name = "chat"
 path = "src/chat.rs"
@@ -32,4 +39,12 @@ path = "src/chat.rs"
 [[bin]]
 name = "chatui"
 path = "src/chatui.rs"
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
 
