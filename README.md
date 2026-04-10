@@ -4,6 +4,7 @@ A minimal, terminal-native AI agent runtime built in Rust. It connects to the An
 
 ## Features
 
+- **OAuth login** — Sign in with your Claude Pro/Max account via browser; tokens stored locally with auto-refresh (no API key needed)
 - **Server/client architecture** — One server holds the runtime and session; multiple clients connect via WebSocket and share a persistent conversation
 - **Streaming SSE** — Real-time token streaming with thinking block display
 - **Tool use loop** — Autonomous multi-step tool execution with cancellation support
@@ -21,7 +22,7 @@ A minimal, terminal-native AI agent runtime built in Rust. It connects to the An
 ### Prerequisites
 
 - Rust toolchain (1.70+)
-- An Anthropic API key
+- Either a Claude Pro/Max account **or** an Anthropic API key
 
 ### Setup
 
@@ -31,10 +32,17 @@ git clone <repo-url>
 cd SynapsCLI
 cargo build --release
 
-# Set your API key
+# ── Authentication (pick one) ───────────────────────────────
+
+# Option A: Sign in with your Claude account (Pro/Max/Team/Enterprise)
+cargo run --bin login
+# Opens your browser, saves tokens to ~/.synaps-cli/auth.json,
+# auto-refreshes before expiry. Shared format with Claude Code and Pi.
+
+# Option B: Use an API key
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# Or create a config
+# ── Optional config ─────────────────────────────────────────
 mkdir -p ~/.synaps-cli
 echo "model = claude-opus-4-6" > ~/.synaps-cli/config
 echo "thinking = medium" >> ~/.synaps-cli/config
@@ -43,6 +51,10 @@ echo "thinking = medium" >> ~/.synaps-cli/config
 ### Run
 
 ```bash
+# ── First-time login (Claude Pro/Max accounts) ──────────────
+
+cargo run --bin login                    # browser-based OAuth login
+
 # ── Server/Client mode (recommended) ────────────────────────
 
 # Start the server (holds runtime + session, listens for WebSocket clients)
@@ -93,7 +105,9 @@ cargo run --bin synaps-cli run "explain quicksort"
 
 src/
 ├── lib.rs          # Module exports
-├── runtime.rs      # Core runtime: API calls, SSE parsing, tool loop, auth
+├── runtime.rs      # Core runtime: API calls, SSE parsing, tool loop, auth refresh
+├── auth.rs         # OAuth 2.0 + PKCE flow, callback server, locked token refresh
+├── login.rs        # `login` binary: browser-based OAuth login
 ├── tools.rs        # Tool registry and 7 tool implementations
 ├── session.rs      # Session persistence: save, load, list, find
 ├── protocol.rs     # Shared client/server message types
@@ -180,7 +194,7 @@ All messages are JSON-serialized. The server→client messages map directly to t
 
 The `Runtime` struct is the core engine. It handles:
 
-- **Authentication** — Reads `ANTHROPIC_API_KEY` from the environment (or OAuth from `~/.pi/agent/auth.json`)
+- **Authentication** — Reads OAuth credentials from `~/.synaps-cli/auth.json` (created by the `login` binary) or falls back to `ANTHROPIC_API_KEY` from the environment. OAuth tokens are automatically refreshed before expiry with cross-process file locking (see [Authentication](#authentication) section below).
 - **SSE streaming** — Parses `content_block_start`, `content_block_delta`, `content_block_stop` events, accumulating thinking blocks (with signatures), text, and tool use blocks
 - **Tool loop** — When the model returns `tool_use` blocks, executes each tool, sends results back, and continues until the model responds with text only. Updated message history is sent after each iteration so the UI stays in sync.
 - **Cancellation** — Accepts a `CancellationToken` that can abort between API calls, between tool executions, or mid-tool via `tokio::select!`. Partial message history is preserved on cancellation.
@@ -417,9 +431,65 @@ Default (when no flag or file exists):
 
 ### Authentication
 
-Set `ANTHROPIC_API_KEY` in your environment. The runtime sends it via the `x-api-key` header with `anthropic-version: 2023-06-01`.
+SynapsCLI supports two authentication modes:
 
-Also supports OAuth tokens from `~/.pi/agent/auth.json` (auto-detected).
+#### OAuth (recommended — Claude Pro/Max/Team/Enterprise)
+
+Run the `login` binary to start a browser-based OAuth flow:
+
+```bash
+cargo run --bin login
+```
+
+**What happens:**
+
+1. Generates a PKCE verifier + S256 challenge
+2. Starts a local HTTP server on `127.0.0.1:53692` to capture the OAuth callback
+3. Opens your browser to `claude.ai/oauth/authorize`
+4. After you sign in, claude.ai redirects to `http://localhost:53692/callback?code=...&state=...`
+5. The server captures the code and exchanges it for access + refresh tokens at `platform.claude.com/v1/oauth/token`
+6. Tokens are saved to `~/.synaps-cli/auth.json` with `chmod 600`
+
+**Manual fallback (SSH / headless):** If the browser can't open or you're on a remote host, the login prompt also accepts pasted input — a full redirect URL, `code#state`, or just the raw code.
+
+**Auto-refresh:** Before every API call, the runtime checks if the token is expired. If so, it acquires an exclusive `flock` on `auth.json`, re-reads the file (in case another instance already refreshed), and only hits the token endpoint if still needed. This makes it safe to run multiple SynapsCLI instances simultaneously — they'll serialize on the lock rather than thundering the refresh endpoint. A 5-minute buffer is applied to `expires` to avoid mid-call failures.
+
+**File format** (compatible with Pi and Claude Code):
+
+```json
+{
+  "anthropic": {
+    "type": "oauth",
+    "access": "sk-ant-oat01-...",
+    "refresh": "sk-ant-ort01-...",
+    "expires": 1775832022076
+  }
+}
+```
+
+OAuth requests use the `Bearer` authorization header plus `anthropic-beta: claude-code-20250219,oauth-2025-04-20`. The system prompt is wrapped in a Claude Code header block required by the OAuth-authenticated endpoint.
+
+#### API key
+
+Set `ANTHROPIC_API_KEY` in your environment:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+The runtime sends it via the `x-api-key` header with `anthropic-version: 2023-06-01`.
+
+#### Syncing auth across machines
+
+The `scripts/synapsync` helper rsyncs `~/.synaps-cli/auth.json` from one host to another (e.g., from your main box to a homelab server). Install it to `~/bin/synapsync` or anywhere on `$PATH`:
+
+```bash
+cp scripts/synapsync ~/bin/synapsync
+chmod +x ~/bin/synapsync
+synapsync                                    # defaults to syncing to "jade"
+```
+
+Edit the `REMOTE` variable in the script to change the target host.
 
 ## Cost Tracking
 
@@ -443,13 +513,18 @@ The running total is displayed in the TUI footer, client status response, and pe
 | reqwest | HTTP client with streaming |
 | serde / serde_json | Serialization |
 | clap | CLI argument parsing |
-| axum | HTTP/WebSocket server |
+| axum | HTTP/WebSocket server + OAuth callback server |
 | tokio-tungstenite | WebSocket client |
 | tower / tower-http | Server middleware |
 | ratatui | Terminal UI framework |
 | crossterm | Terminal backend + input events |
 | tachyonfx | Terminal animations (fade-in, dissolve) |
 | syntect | Syntax highlighting for code blocks |
+| sha2 | SHA-256 for PKCE code challenge |
+| rand | Cryptographic RNG for PKCE verifier and state |
+| base64 | URL-safe base64 encoding for PKCE |
+| url / urlencoding | URL parsing and query param encoding |
+| fs4 | Cross-process file locking for auth.json refresh |
 | chrono | Timestamps |
 | uuid | Session ID generation |
 | tokio-util | CancellationToken for streaming abort |
