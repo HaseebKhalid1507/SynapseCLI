@@ -110,6 +110,11 @@ async fn main() -> Result<()> {
                     println!("\n\x1b[33m→ [steering] {}\x1b[0m", message);
                     io::stdout().flush().unwrap();
                 }
+                StreamEvent::CompactionDone { before_tokens, after_tokens } => {
+                    println!("\n\x1b[35m⟳ compacted: {} → {} tokens (saved ~{})\x1b[0m",
+                        before_tokens, after_tokens, before_tokens.saturating_sub(after_tokens));
+                    io::stdout().flush().unwrap();
+                }
                 StreamEvent::Done => {
                     if in_thinking {
                         print!("\n");

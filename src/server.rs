@@ -430,7 +430,8 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
             StreamEvent::SubagentStart { .. }
             | StreamEvent::SubagentUpdate { .. }
             | StreamEvent::SubagentDone { .. }
-            | StreamEvent::SteeringDelivered { .. } => {}
+            | StreamEvent::SteeringDelivered { .. }
+            | StreamEvent::CompactionDone { .. } => {}
             StreamEvent::Error(err) => {
                 let _ = broadcast.send(ServerMessage::Error { message: err.clone() });
                 state.push_history(HistoryEntry::Error {

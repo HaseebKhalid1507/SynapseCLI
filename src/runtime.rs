@@ -64,6 +64,11 @@ pub enum StreamEvent {
     SteeringDelivered {
         message: String,
     },
+    /// Compaction completed — old turns summarized
+    CompactionDone {
+        before_tokens: usize,
+        after_tokens: usize,
+    },
     /// Full message history after the tool loop completes, for multi-turn context
     MessageHistory(Vec<Value>),
     Usage {
@@ -95,6 +100,7 @@ pub struct Runtime {
     tools: ToolRegistry,
     system_prompt: Option<String>,
     thinking_budget: u32,
+    pub compaction: crate::compaction::CompactionConfig,
 }
 
 impl Runtime {
@@ -113,6 +119,7 @@ impl Runtime {
             tools: ToolRegistry::new(),
             system_prompt: None,
             thinking_budget: 4096,
+            compaction: crate::compaction::CompactionConfig::default(),
         })
     }
 
@@ -422,11 +429,16 @@ impl Runtime {
         let tools = self.tools.clone();
         let system_prompt = self.system_prompt.clone();
         let thinking_budget = self.thinking_budget;
+        let compaction_config = if self.compaction.enabled {
+            Some(self.compaction.clone())
+        } else {
+            None
+        };
 
         tokio::spawn(async move {
             if let Err(e) = Self::run_stream_internal(
                 auth, client, model, tools, system_prompt, thinking_budget,
-                messages, tx.clone(), cancel, steering_rx,
+                messages, tx.clone(), cancel, steering_rx, compaction_config,
             ).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
@@ -447,6 +459,7 @@ impl Runtime {
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: CancellationToken,
         mut steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+        compaction_config: Option<crate::compaction::CompactionConfig>,
     ) -> Result<()> {
         let mut messages = initial_messages;
 
@@ -705,6 +718,22 @@ impl Runtime {
                 // These get injected as user messages before the next LLM call,
                 // allowing the user to redirect the agent mid-work.
                 Self::drain_steering(&mut steering_rx, &mut messages, &tx);
+
+                // Check if compaction is needed before next API call
+                if let Some(ref cc) = compaction_config {
+                    if crate::compaction::should_compact(cc, &messages) {
+                        tracing::info!("Compaction triggered at {} est tokens", crate::compaction::estimate_tokens(&messages));
+                        match crate::compaction::compact_messages(cc, &messages, Some(&tx)).await {
+                            Ok(compacted) => {
+                                messages = compacted;
+                            }
+                            Err(e) => {
+                                tracing::error!("Compaction failed: {}", e);
+                                // Continue without compaction — don't break the session
+                            }
+                        }
+                    }
+                }
 
                 // Continue the loop to get Claude's response with tool results
             } else {
@@ -1261,6 +1290,7 @@ impl Clone for Runtime {
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
             thinking_budget: self.thinking_budget,
+            compaction: self.compaction.clone(),
         }
     }
 }

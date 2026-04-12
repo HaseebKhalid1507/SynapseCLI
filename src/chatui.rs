@@ -1683,6 +1683,9 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                        k if k.starts_with("compaction") => {
+                            runtime.compaction.apply(k, val);
+                        }
                         _ => {}
                     }
                 }
@@ -2203,6 +2206,7 @@ async fn main() -> Result<()> {
                         | StreamEvent::SubagentUpdate { .. }
                         | StreamEvent::SubagentDone { .. }
                         | StreamEvent::SteeringDelivered { .. }
+                        | StreamEvent::CompactionDone { .. }
                         | StreamEvent::Done
                         | StreamEvent::Error(_)
                     );
@@ -2311,6 +2315,15 @@ async fn main() -> Result<()> {
                             }
                             app.scroll_back = 0;
                             app.scroll_pinned = true;
+                            app.dirty = true;
+                            app.line_cache.clear();
+                        }
+                        StreamEvent::CompactionDone { before_tokens, after_tokens } => {
+                            let saved = before_tokens.saturating_sub(after_tokens);
+                            app.push_msg(ChatMessage::System(
+                                format!("⟳ compacted: ~{}K → ~{}K tokens (saved ~{}K)",
+                                    before_tokens / 1000, after_tokens / 1000, saved / 1000)
+                            ));
                             app.dirty = true;
                             app.line_cache.clear();
                         }

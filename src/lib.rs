@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod auth;
 pub mod logging;
 pub mod config;
+pub mod compaction;
 
 pub use runtime::{Runtime, StreamEvent};
 pub use tools::{ToolType, ToolRegistry};
