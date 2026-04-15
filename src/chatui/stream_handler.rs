@@ -1,50 +1,46 @@
-//! Stream event handling — processes StreamEvent variants from the runtime.
+//! Agent event handling — processes AgentEvent variants from the bus.
 
-
-use synaps_cli::{Runtime, StreamEvent};
+use synaps_cli::transport::{AgentEvent, ToolEvent, SubagentEvent, MetaEvent};
 
 use super::app::{App, ChatMessage, SubagentState};
 
-/// What the event loop should do after processing a stream event.
+/// What the event loop should do after processing an agent event.
 pub(super) enum StreamAction {
     /// Continue processing — no special action needed.
     Continue,
-    /// Stream completed and a queued message should be auto-sent.
+    /// Turn completed and a queued message should be auto-sent.
     AutoSendQueued(String),
 }
 
 /// Returns true if the event should trigger an immediate redraw.
-pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
+pub(super) fn needs_immediate_draw(event: &AgentEvent) -> bool {
     matches!(event,
-        StreamEvent::ToolUse { .. }
-        | StreamEvent::ToolResult { .. }
-        | StreamEvent::SubagentStart { .. }
-        | StreamEvent::SubagentUpdate { .. }
-        | StreamEvent::SubagentDone { .. }
-        | StreamEvent::SteeringDelivered { .. }
-        | StreamEvent::Done
-        | StreamEvent::Error(_)
+        AgentEvent::Tool(ToolEvent::Invoke { .. })
+        | AgentEvent::Tool(ToolEvent::Complete { .. })
+        | AgentEvent::Subagent(_)
+        | AgentEvent::Meta(MetaEvent::Steered { .. })
+        | AgentEvent::TurnComplete
+        | AgentEvent::Error(_)
     )
 }
 
-/// Process a StreamEvent, update app state, return what the loop should do.
-pub(super) async fn handle_stream_event(
-    event: StreamEvent,
+/// Process an AgentEvent, update app state, return what the loop should do.
+pub(super) fn handle_agent_event(
+    event: AgentEvent,
     app: &mut App,
-    runtime: &Runtime,
 ) -> StreamAction {
     match event {
-        StreamEvent::Thinking(text) => {
+        AgentEvent::Thinking(text) => {
             app.append_or_update_thinking(&text);
         }
-        StreamEvent::Text(text) => {
+        AgentEvent::Text(text) => {
             app.append_or_update_text(&text);
         }
-        StreamEvent::ToolUseStart(name) => {
+        AgentEvent::Tool(ToolEvent::Start { tool_name, .. }) => {
             app.tool_start_time = Some(std::time::Instant::now());
-            app.push_msg(ChatMessage::ToolUseStart(name, String::new()));
+            app.push_msg(ChatMessage::ToolUseStart(tool_name, String::new()));
         }
-        StreamEvent::ToolUseDelta(delta) => {
+        AgentEvent::Tool(ToolEvent::ArgsDelta(delta)) => {
             if let Some(last) = app.messages.last_mut() {
                 if let ChatMessage::ToolUseStart(_, ref mut partial) = last.msg {
                     partial.push_str(&delta);
@@ -53,7 +49,7 @@ pub(super) async fn handle_stream_event(
                 }
             }
         }
-        StreamEvent::ToolUse { tool_name, input, .. } => {
+        AgentEvent::Tool(ToolEvent::Invoke { tool_name, input, .. }) => {
             app.tool_start_time = Some(std::time::Instant::now());
             let input_str = serde_json::to_string(&input).unwrap_or_default();
             if let Some(last) = app.messages.last_mut() {
@@ -68,7 +64,7 @@ pub(super) async fn handle_stream_event(
             }
             app.push_msg(ChatMessage::ToolUse { tool_name, input: input_str });
         }
-        StreamEvent::ToolResultDelta { delta, .. } => {
+        AgentEvent::Tool(ToolEvent::OutputDelta { delta, .. }) => {
             if let Some(last) = app.messages.last_mut() {
                 if let ChatMessage::ToolResult { ref mut content, .. } = last.msg {
                     content.push_str(&delta);
@@ -79,27 +75,21 @@ pub(super) async fn handle_stream_event(
             }
             app.push_msg(ChatMessage::ToolResult { content: delta, elapsed_ms: None });
         }
-        StreamEvent::ToolResult { result, .. } => {
-            let elapsed = app.tool_start_time.take()
-                .map(|t| t.elapsed().as_millis() as u64);
+        AgentEvent::Tool(ToolEvent::Complete { result, elapsed_ms, .. }) => {
             if let Some(last) = app.messages.last_mut() {
                 if let ChatMessage::ToolResult { ref mut content, elapsed_ms: ref mut el, .. } = last.msg {
                     *content = result;
-                    *el = elapsed;
+                    *el = elapsed_ms;
                     app.dirty = true;
                     app.line_cache.clear();
                     return StreamAction::Continue;
                 }
             }
-            app.push_msg(ChatMessage::ToolResult { content: result, elapsed_ms: elapsed });
+            app.push_msg(ChatMessage::ToolResult { content: result, elapsed_ms });
         }
-        StreamEvent::MessageHistory(history) => {
-            app.api_messages = history;
-            app.save_session().await;
-        }
-        StreamEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
+        AgentEvent::Subagent(SubagentEvent::Start { id, agent_name, task_preview }) => {
             app.subagents.push(SubagentState {
-                id: subagent_id,
+                id,
                 name: agent_name,
                 status: format!("starting: {}", task_preview),
                 start_time: std::time::Instant::now(),
@@ -109,15 +99,15 @@ pub(super) async fn handle_stream_event(
             app.dirty = true;
             app.line_cache.clear();
         }
-        StreamEvent::SubagentUpdate { subagent_id, status, .. } => {
-            if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
+        AgentEvent::Subagent(SubagentEvent::Update { id, status, .. }) => {
+            if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == id) {
                 sa.status = status;
             }
             app.dirty = true;
             app.line_cache.clear();
         }
-        StreamEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. } => {
-            if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
+        AgentEvent::Subagent(SubagentEvent::Done { id, result_preview, duration_secs, .. }) => {
+            if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == id) {
                 sa.done = true;
                 sa.duration_secs = Some(duration_secs);
                 let preview: String = result_preview.chars().take(40).collect();
@@ -132,7 +122,7 @@ pub(super) async fn handle_stream_event(
             app.dirty = true;
             app.line_cache.clear();
         }
-        StreamEvent::SteeringDelivered { message } => {
+        AgentEvent::Meta(MetaEvent::Steered { message }) => {
             app.push_msg(ChatMessage::User(message.clone()));
             if app.queued_message.as_ref() == Some(&message) {
                 app.queued_message = None;
@@ -142,23 +132,23 @@ pub(super) async fn handle_stream_event(
             app.dirty = true;
             app.line_cache.clear();
         }
-        StreamEvent::Usage {
+        AgentEvent::Meta(MetaEvent::Usage {
             input_tokens,
             output_tokens,
-            cache_read_input_tokens,
-            cache_creation_input_tokens,
-            model: usage_model,
-        } => {
-            let model_for_pricing = usage_model.as_deref().unwrap_or(runtime.model());
-            app.add_usage(
-                input_tokens,
-                output_tokens,
-                cache_read_input_tokens,
-                cache_creation_input_tokens,
-                model_for_pricing,
-            );
+            cache_read_tokens,
+            cache_creation_tokens,
+            cost_usd,
+            ..
+        }) => {
+            app.add_usage(input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd);
         }
-        StreamEvent::Done => {
+        AgentEvent::Meta(MetaEvent::SessionStats { .. }) => {
+            // Stats tracked by driver; TUI doesn't need these
+        }
+        AgentEvent::Meta(MetaEvent::Shutdown { .. }) => {
+            // Driver is shutting down — TUI will exit on its own
+        }
+        AgentEvent::TurnComplete => {
             app.streaming = false;
             app.subagents.clear();
 
@@ -167,19 +157,10 @@ pub(super) async fn handle_stream_event(
                 return StreamAction::AutoSendQueued(queued);
             }
         }
-        StreamEvent::Error(err) => {
+        AgentEvent::Error(err) => {
             app.push_msg(ChatMessage::Error(err));
             app.streaming = false;
             app.subagents.clear();
-            // Restore a valid trailing state — drop unmatched trailing messages
-            if let Some(last) = app.api_messages.last() {
-                let role = last["role"].as_str().unwrap_or("");
-                let is_text_user = role == "user" && last["content"].is_string();
-                let is_assistant = role == "assistant";
-                if is_text_user || is_assistant {
-                    app.api_messages.pop();
-                }
-            }
         }
     }
     StreamAction::Continue

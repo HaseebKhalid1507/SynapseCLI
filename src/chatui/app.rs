@@ -70,6 +70,9 @@ pub(crate) struct App {
     pub(crate) status_text: Option<String>,
     /// GamblersDen child process — spawned by /gamba, killed when streaming finishes
     pub(crate) gamba_child: Option<std::process::Child>,
+    /// Local display copies of model name and thinking level
+    pub(crate) model_name: String,
+    pub(crate) thinking_level: String,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -87,6 +90,8 @@ pub(crate) struct SubagentState {
 
 impl App {
     pub(crate) fn new(session: Session) -> Self {
+        let model_name = session.model.clone();
+        let thinking_level = session.thinking_level.clone();
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -122,6 +127,8 @@ impl App {
             spinner_frame: 0,
             status_text: None,
             gamba_child: None,
+            model_name,
+            thinking_level,
         }
     }
 
@@ -206,7 +213,7 @@ impl App {
         output_tokens: u64,
         cache_read: u64,
         cache_creation: u64,
-        model: &str,
+        cost_usd: f64,
     ) {
         self.input_tokens = input_tokens;
         self.output_tokens = output_tokens;
@@ -214,19 +221,7 @@ impl App {
         self.total_output_tokens += output_tokens;
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
-        // Pricing per million tokens (as of 2025)
-        let (input_price, output_price) = match model {
-            m if m.contains("opus") => (15.0, 75.0),
-            m if m.contains("sonnet") => (3.0, 15.0),
-            m if m.contains("haiku") => (0.80, 4.0),
-            _ => (3.0, 15.0), // default to sonnet pricing
-        };
-        // Cache reads bill at 0.1x input price; cache writes at 1.25x
-        let cost = (input_tokens as f64 / 1_000_000.0) * input_price
-                 + (cache_read as f64 / 1_000_000.0) * input_price * 0.1
-                 + (cache_creation as f64 / 1_000_000.0) * input_price * 1.25
-                 + (output_tokens as f64 / 1_000_000.0) * output_price;
-        self.session_cost += cost;
+        self.session_cost += cost_usd;
     }
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {

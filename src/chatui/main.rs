@@ -17,7 +17,8 @@ use commands::CommandAction;
 use input::InputAction;
 use stream_handler::StreamAction;
 
-use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, latest_session, find_session};
+use synaps_cli::{Runtime, Result, Session, latest_session, find_session};
+use synaps_cli::transport::{Inbound, ConversationDriver, driver::DriverConfig};
 use clap::Parser;
 use crossterm::{
     event::{EventStream, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
@@ -130,8 +131,12 @@ async fn main() -> Result<()> {
 
     let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
 
+    // Capture display info before handing runtime to driver
+    let model_name = runtime.model().to_string();
+    let thinking_level = runtime.thinking_level().to_string();
+
     // Session: continue existing or create new
-    let mut app = match cli.continue_session {
+    let (mut app, session) = match cli.continue_session {
         Some(maybe_id) => {
             let session = match maybe_id {
                 Some(id) => find_session(&id).unwrap_or_else(|e| {
@@ -153,17 +158,41 @@ async fn main() -> Result<()> {
             app.total_output_tokens = session.total_output_tokens;
             app.session_cost = session.session_cost;
             app.abort_context = session.abort_context.clone();
+            app.model_name = session.model.clone();
+            app.thinking_level = runtime.thinking_level().to_string();
             rebuild_display_messages(&session.api_messages, &mut app);
             app.push_msg(ChatMessage::System(format!("resumed session {}", session.id)));
             if app.abort_context.is_some() {
                 app.push_msg(ChatMessage::System("⚠ abort context from previous session will be injected into next message".to_string()));
             }
-            app
+            (app, session)
         }
         None => {
-            App::new(Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt()))
+            let session = Session::new(&model_name, &thinking_level, runtime.system_prompt());
+            let app = App::new(session.clone());
+            (app, session)
         }
     };
+
+    // ── Create driver and bus ──
+    let driver_config = DriverConfig {
+        agent_name: None,
+        auto_save: true,
+        event_buffer_size: 100,
+    };
+    let mut driver = ConversationDriver::new(runtime, session, driver_config);
+
+    // Get bus handle before spawning driver
+    let bus_handle = driver.bus().handle();
+    let mut event_rx = bus_handle.subscribe();
+    let inbound_tx = bus_handle.inbound();
+
+    // Spawn driver in background
+    tokio::spawn(async move {
+        if let Err(e) = driver.run().await {
+            tracing::error!("Driver error: {}", e);
+        }
+    });
 
     // ── Terminal setup ──
     enable_raw_mode().map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
@@ -174,9 +203,6 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)
         .map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
     let mut event_reader = EventStream::new();
-    let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
-    let mut cancel_token: Option<CancellationToken> = None;
-    let mut steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
     let mut boot_fx: Option<Effect> = Some(boot_effect());
     let mut exit_fx: Option<Effect> = None;
     let mut last_frame = Instant::now();
@@ -185,7 +211,7 @@ async fn main() -> Result<()> {
     loop {
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
-        let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
+        { let m = app.model_name.clone(); let t = app.thinking_level.clone(); let _ = draw(&mut terminal, &mut app, &m, &t, &mut boot_fx, &mut exit_fx, elapsed); }
 
         tokio::select! {
             // ── Tick: animations + spinner (~60fps) ──
@@ -212,7 +238,7 @@ async fn main() -> Result<()> {
                     app.line_cache.clear();
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
-                    let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
+                    { let m = app.model_name.clone(); let t = app.thinking_level.clone(); let _ = draw(&mut terminal, &mut app, &m, &t, &mut boot_fx, &mut exit_fx, elapsed); }
                 }
                 if exit_fx.as_ref().is_some_and(|fx| fx.done()) {
                     break;
@@ -232,14 +258,11 @@ async fn main() -> Result<()> {
                                 exit_fx = Some(quit_effect());
                             }
                             InputAction::Abort => {
-                                if let Some(ref ct) = cancel_token { ct.cancel(); }
+                                let _ = inbound_tx.send(Inbound::Cancel);
                                 app.capture_abort_context();
                                 if let Some(ref q) = app.queued_message.take() {
                                     app.push_msg(ChatMessage::System(format!("dequeued: {}", q)));
                                 }
-                                stream = None;
-                                cancel_token = None;
-                                steer_tx = None;
                                 app.streaming = false;
                                 app.subagents.clear();
                                 let abort_msg = if app.abort_context.is_some() {
@@ -251,7 +274,7 @@ async fn main() -> Result<()> {
                                 app.save_session().await;
                             }
                             InputAction::SlashCommand(cmd, arg) => {
-                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path).await {
+                                match commands::handle_command(&cmd, &arg, &mut app, &inbound_tx, &system_prompt_path).await {
                                     CommandAction::None => {}
                                     CommandAction::StartStream => {} // reserved for future use
                                     CommandAction::Quit => {
@@ -302,20 +325,18 @@ async fn main() -> Result<()> {
                                 } else {
                                     input
                                 };
-                                app.api_messages.push(json!({"role": "user", "content": api_content}));
-                                let ct = CancellationToken::new();
-                                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                // Keep local mirror
+                                app.api_messages.push(json!({"role": "user", "content": api_content.clone()}));
+                                // Send to driver via bus
+                                let _ = inbound_tx.send(Inbound::Message { content: api_content });
                                 app.status_text = Some("connecting…".to_string());
                                 app.streaming = true;
                                 app.spinner_frame = 0;
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
-                                stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                                { let m = app.model_name.clone(); let t = app.thinking_level.clone(); let _ = draw(&mut terminal, &mut app, &m, &t, &mut boot_fx, &mut exit_fx, elapsed); }
                                 app.status_text = None;
                                 app.push_msg(ChatMessage::Thinking("…".to_string()));
-                                cancel_token = Some(ct);
-                                steer_tx = Some(s_tx);
                             }
                             InputAction::StreamingInput(input) => {
                                 // Check for streaming slash commands
@@ -324,15 +345,9 @@ async fn main() -> Result<()> {
                                     let cmd = commands::resolve_prefix(raw_cmd, commands::STREAMING_COMMANDS);
                                     match commands::handle_streaming_command(&cmd, &input, &mut app) {
                                         CommandAction::None => {
-                                            // Unknown streaming command — steer/queue as normal
-                                            let steered = steer_tx.as_ref()
-                                                .map(|tx| tx.send(input.clone()).is_ok())
-                                                .unwrap_or(false);
-                                            if steered {
-                                                app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
-                                            } else {
-                                                app.push_msg(ChatMessage::System(format!("queued: {}", input)));
-                                            }
+                                            // Unknown streaming command — steer/queue
+                                            let _ = inbound_tx.send(Inbound::Steer { content: input.clone() });
+                                            app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
                                             app.queued_message = Some(input);
                                         }
                                         CommandAction::Quit => {
@@ -353,14 +368,8 @@ async fn main() -> Result<()> {
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
-                                    let steered = steer_tx.as_ref()
-                                        .map(|tx| tx.send(input.clone()).is_ok())
-                                        .unwrap_or(false);
-                                    if steered {
-                                        app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
-                                    } else {
-                                        app.push_msg(ChatMessage::System(format!("queued: {}", input)));
-                                    }
+                                    let _ = inbound_tx.send(Inbound::Steer { content: input.clone() });
+                                    app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
                                     app.queued_message = Some(input);
                                 }
                             }
@@ -370,25 +379,30 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // ── Stream events from runtime ──
-            maybe_event = async {
-                if let Some(ref mut s) = stream {
-                    s.next().await
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                if let Some(event) = maybe_event {
-                    let do_draw = stream_handler::needs_immediate_draw(&event);
-                    let action = stream_handler::handle_stream_event(event, &mut app, &runtime).await;
+            // ── Agent events from bus ──
+            event = event_rx.recv() => {
+                match event {
+                    Ok(event) => {
+                        let do_draw = stream_handler::needs_immediate_draw(&event);
+                        let action = stream_handler::handle_agent_event(event, &mut app);
 
-                    match action {
-                        StreamAction::Continue => {
-                            // For Done/Error, clear stream state
-                            if !app.streaming {
-                                stream = None;
-                                cancel_token = None;
-                                steer_tx = None;
+                        match action {
+                            StreamAction::Continue => {
+                                // For Done/Error, clear stream state
+                                if !app.streaming {
+                                    // Reclaim gamba if running
+                                    if let Some(msg) = app.reclaim_gamba() {
+                                        terminal.clear().ok();
+                                        app.push_msg(ChatMessage::System(msg));
+                                        app.dirty = true;
+                                        app.line_cache.clear();
+                                        let elapsed = last_frame.elapsed();
+                                        last_frame = Instant::now();
+                                        { let m = app.model_name.clone(); let t = app.thinking_level.clone(); let _ = draw(&mut terminal, &mut app, &m, &t, &mut boot_fx, &mut exit_fx, elapsed); }
+                                    }
+                                }
+                            }
+                            StreamAction::AutoSendQueued(queued) => {
                                 // Reclaim gamba if running
                                 if let Some(msg) = app.reclaim_gamba() {
                                     terminal.clear().ok();
@@ -397,57 +411,43 @@ async fn main() -> Result<()> {
                                     app.line_cache.clear();
                                     let elapsed = last_frame.elapsed();
                                     last_frame = Instant::now();
-                                    let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
+                                    { let m = app.model_name.clone(); let t = app.thinking_level.clone(); let _ = draw(&mut terminal, &mut app, &m, &t, &mut boot_fx, &mut exit_fx, elapsed); }
                                 }
-                            }
-                        }
-                        StreamAction::AutoSendQueued(queued) => {
-                            // Drop old stream state (important for cleanup)
-                            drop(stream.take());
-                            drop(cancel_token.take());
-                            drop(steer_tx.take());
-                            // Reclaim gamba if running
-                            if let Some(msg) = app.reclaim_gamba() {
-                                terminal.clear().ok();
-                                app.push_msg(ChatMessage::System(msg));
-                                app.dirty = true;
-                                app.line_cache.clear();
+                                // Auto-send the queued message
+                                app.push_msg(ChatMessage::User(queued.clone()));
+                                app.scroll_back = 0;
+                                app.scroll_pinned = true;
+                                let api_content = if let Some(ref ctx) = app.abort_context {
+                                    let combined = format!("{}\n\n{}", ctx, queued);
+                                    app.abort_context = None;
+                                    combined
+                                } else {
+                                    queued
+                                };
+                                app.api_messages.push(json!({"role": "user", "content": api_content.clone()}));
+                                let _ = inbound_tx.send(Inbound::Message { content: api_content });
+                                app.status_text = Some("connecting…".to_string());
+                                app.streaming = true;
+                                app.spinner_frame = 0;
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
+                                { let m = app.model_name.clone(); let t = app.thinking_level.clone(); let _ = draw(&mut terminal, &mut app, &m, &t, &mut boot_fx, &mut exit_fx, elapsed); }
+                                app.status_text = None;
+                                app.push_msg(ChatMessage::Thinking("…".to_string()));
                             }
-                            // Auto-send the queued message
-                            app.push_msg(ChatMessage::User(queued.clone()));
-                            app.scroll_back = 0;
-                            app.scroll_pinned = true;
-                            let api_content = if let Some(ref ctx) = app.abort_context {
-                                let combined = format!("{}\n\n{}", ctx, queued);
-                                app.abort_context = None;
-                                combined
-                            } else {
-                                queued
-                            };
-                            app.api_messages.push(json!({"role": "user", "content": api_content}));
-                            let ct = CancellationToken::new();
-                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            app.status_text = Some("connecting…".to_string());
-                            app.streaming = true;
-                            app.spinner_frame = 0;
+                        }
+
+                        if do_draw {
                             let elapsed = last_frame.elapsed();
                             last_frame = Instant::now();
-                            let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
-                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
-                            app.status_text = None;
-                            app.push_msg(ChatMessage::Thinking("…".to_string()));
-                            cancel_token = Some(ct);
-                            steer_tx = Some(s_tx);
+                            { let m = app.model_name.clone(); let t = app.thinking_level.clone(); let _ = draw(&mut terminal, &mut app, &m, &t, &mut boot_fx, &mut exit_fx, elapsed); }
                         }
                     }
-
-                    if do_draw {
-                        let elapsed = last_frame.elapsed();
-                        last_frame = Instant::now();
-                        let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("TUI lagged, missed {} events", n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
                     }
                 }
             }

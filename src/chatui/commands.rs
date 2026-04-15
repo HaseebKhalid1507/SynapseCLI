@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use synaps_cli::{Runtime, Session, list_sessions, find_session};
+use tokio::sync::mpsc;
+
+use synaps_cli::{Session, list_sessions, find_session};
+use synaps_cli::transport::Inbound;
 
 use super::app::{App, ChatMessage};
 
@@ -46,9 +49,10 @@ pub(super) async fn handle_command(
     cmd: &str,
     arg: &str,
     app: &mut App,
-    runtime: &mut Runtime,
+    inbound_tx: &mpsc::UnboundedSender<Inbound>,
     system_prompt_path: &PathBuf,
 ) -> CommandAction {
+    let _ = system_prompt_path; // reserved for future use
     match cmd {
         "clear" => {
             app.save_session().await;
@@ -62,16 +66,19 @@ pub(super) async fn handle_command(
             app.session_cost = 0.0;
             app.input_tokens = 0;
             app.output_tokens = 0;
-            app.session = Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt());
+            app.session = Session::new(&app.model_name, &app.thinking_level, None);
+            // Tell the driver to clear too
+            let _ = inbound_tx.send(Inbound::Command { name: "clear".into(), args: String::new() });
             app.push_msg(ChatMessage::System("new session started".to_string()));
         }
         "model" => {
             if arg.is_empty() {
                 app.push_msg(ChatMessage::System(
-                    format!("current model: {}", runtime.model())
+                    format!("current model: {}", app.model_name)
                 ));
             } else {
-                runtime.set_model(arg.to_string());
+                app.model_name = arg.to_string();
+                let _ = inbound_tx.send(Inbound::Command { name: "model".into(), args: arg.to_string() });
                 app.push_msg(ChatMessage::System(
                     format!("model set to: {}", arg)
                 ));
@@ -83,20 +90,17 @@ pub(super) async fn handle_command(
                     "usage: /system <prompt>  |  /system save  |  /system show".to_string()
                 ));
             } else if arg == "save" {
-                let _ = std::fs::create_dir_all(synaps_cli::config::get_active_config_dir());
-                match std::fs::write(system_prompt_path, runtime.system_prompt().unwrap_or("")) {
-                    Ok(_) => app.push_msg(ChatMessage::System(
-                        format!("saved to {}", system_prompt_path.display())
-                    )),
-                    Err(e) => app.push_msg(ChatMessage::Error(
-                        format!("failed to save: {}", e)
-                    )),
-                }
+                // System prompt save is local — we don't have the prompt text anymore.
+                // Just inform the user to use /system show to see the current prompt.
+                app.push_msg(ChatMessage::System(
+                    "system prompt save not available in bus mode — prompt is managed by the driver".to_string()
+                ));
             } else if arg == "show" {
-                let prompt = runtime.system_prompt().unwrap_or("(none)");
-                app.push_msg(ChatMessage::System(prompt.to_string()));
+                // Ask the driver, but for now just show what we know
+                let _ = inbound_tx.send(Inbound::Command { name: "system".into(), args: "show".to_string() });
+                app.push_msg(ChatMessage::System("(queried driver for system prompt)".to_string()));
             } else {
-                runtime.set_system_prompt(arg.to_string());
+                let _ = inbound_tx.send(Inbound::Command { name: "system".into(), args: arg.to_string() });
                 app.push_msg(ChatMessage::System(
                     "system prompt updated".to_string()
                 ));
@@ -104,13 +108,24 @@ pub(super) async fn handle_command(
         }
         "thinking" => {
             match arg {
-                "low" => { runtime.set_thinking_budget(2048); }
-                "medium" | "med" => { runtime.set_thinking_budget(4096); }
-                "high" => { runtime.set_thinking_budget(16384); }
-                "xhigh" => { runtime.set_thinking_budget(32768); }
+                "low" | "medium" | "med" | "high" | "xhigh" => {
+                    let _ = inbound_tx.send(Inbound::Command { name: "thinking".into(), args: arg.to_string() });
+                    // Update local display
+                    let level = match arg {
+                        "low" => "low",
+                        "medium" | "med" => "medium",
+                        "high" => "high",
+                        "xhigh" => "xhigh",
+                        _ => arg,
+                    };
+                    app.thinking_level = level.to_string();
+                    app.push_msg(ChatMessage::System(
+                        format!("thinking set to: {}", level)
+                    ));
+                }
                 "" => {
                     app.push_msg(ChatMessage::System(
-                        format!("thinking: {} ({})", runtime.thinking_level(), runtime.thinking_budget())
+                        format!("thinking: {}", app.thinking_level)
                     ));
                 }
                 _ => {
@@ -118,11 +133,6 @@ pub(super) async fn handle_command(
                         "usage: /thinking low|medium|high|xhigh".to_string()
                     ));
                 }
-            }
-            if !arg.is_empty() && ["low", "medium", "med", "high", "xhigh"].contains(&arg) {
-                app.push_msg(ChatMessage::System(
-                    format!("thinking set to: {}", runtime.thinking_level())
-                ));
             }
         }
         "sessions" => {
@@ -152,10 +162,12 @@ pub(super) async fn handle_command(
             } else {
                 match find_session(arg) {
                     Ok(session) => {
-                        runtime.set_model(session.model.clone());
+                        // Update driver's model/system
+                        let _ = inbound_tx.send(Inbound::Command { name: "model".into(), args: session.model.clone() });
                         if let Some(ref sp) = session.system_prompt {
-                            runtime.set_system_prompt(sp.clone());
+                            let _ = inbound_tx.send(Inbound::Command { name: "system".into(), args: sp.clone() });
                         }
+                        app.model_name = session.model.clone();
                         app.save_session().await;
                         let old_id = app.session.id.clone();
                         app.messages.clear();
