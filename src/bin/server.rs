@@ -19,18 +19,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 struct ServerState {
     bus: BusHandle,
     client_count: AtomicUsize,
+    model: String,
+    thinking_level: String,
+    session_id: String,
 }
 
 impl ServerState {
-    fn sync_state_stub(&self) -> SyncState {
-        // Minimal sync for new connections — driver owns the real state,
-        // but we don't have direct access from here. The transport will
-        // get events from the bus going forward.
+    fn sync_state(&self) -> SyncState {
         SyncState {
             agent_name: None,
-            model: String::new(),
-            thinking_level: String::new(),
-            session_id: String::new(),
+            model: self.model.clone(),
+            thinking_level: self.thinking_level.clone(),
+            session_id: self.session_id.clone(),
             is_streaming: false,
             turn_count: 0,
             total_input_tokens: 0,
@@ -96,6 +96,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let session_id = session.id.clone();
+    let model_name = runtime.model().to_string();
+    let thinking_level = runtime.thinking_level().to_string();
 
     let mut driver = ConversationDriver::new(runtime, session, DriverConfig::default());
     let bus_handle = driver.bus().handle();
@@ -106,6 +108,9 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(ServerState {
         bus: bus_handle,
         client_count: AtomicUsize::new(0),
+        model: model_name,
+        thinking_level,
+        session_id: session_id.clone(),
     });
 
     // Run driver in background
@@ -157,7 +162,7 @@ async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
     let (from_transport_tx, mut from_transport_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     let transport = WebSocketTransport::new(to_transport_rx, from_transport_tx);
-    let sync = state.sync_state_stub();
+    let sync = state.sync_state();
     state.bus.connect(transport, sync);
 
     // Bridge: transport → WebSocket
