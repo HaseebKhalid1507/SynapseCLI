@@ -2,7 +2,7 @@
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
 ![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
-![~14K lines](https://img.shields.io/badge/lines-~14.4K-green.svg)
+![~16K lines](https://img.shields.io/badge/lines-~16.8K-green.svg)
 
 Terminal-native AI agent runtime built in Rust. Chat, orchestrate, deploy autonomous agents — one codebase.
 
@@ -74,6 +74,7 @@ watcher init scout              # Create agent from template
 watcher deploy scout            # Start supervised execution
 watcher status                  # Monitor fleet
 watcher logs scout -f           # Follow logs
+watcher attach scout            # Observe running agent's event stream
 watcher stop scout              # Graceful shutdown
 ```
 
@@ -83,6 +84,7 @@ watcher stop scout              # Graceful shutdown
 name = "scout"
 model = "claude-sonnet-4-20250514"
 trigger = "manual"              # manual | always | watch
+isolation = "task"              # task (in-process) | process (child process)
 
 [trigger]
 paths = ["./src"]               # watch mode: directories to monitor
@@ -185,26 +187,37 @@ Project-local `.synaps-cli/skills/` override global skills.
 
 ## Architecture
 
-8 binaries from 43 source files (~14,400 lines):
+8 binaries from 71 source files (~16,800 lines):
 
 ```
 src/
 ├── lib.rs                   # Crate root & re-exports
-├── bin/                     # Binary entry points
-│   ├── chat.rs              # Headless chat (stdin/stdout)
+├── bin/                     # Binary entry points (6 files)
+│   ├── chat.rs              # Headless chat (stdin/stdout) — 36 lines
 │   ├── cli.rs               # Simple CLI (run/chat subcommands)
-│   ├── agent.rs             # synaps-agent (headless worker for watcher)
+│   ├── agent.rs             # synaps-agent (headless worker) — 39 lines
 │   ├── login.rs             # OAuth login flow
-│   ├── server.rs            # WebSocket server
+│   ├── server.rs            # WebSocket server — 196 lines
 │   └── client.rs            # WebSocket client
-├── core/                    # Shared infrastructure
+├── core/                    # Shared infrastructure (9 files)
 │   ├── config.rs            # Configuration & path resolution
 │   ├── session.rs           # Session persistence
-│   ├── auth.rs              # OAuth + API key authentication
+│   ├── auth/                # OAuth + API key authentication (6 files)
 │   ├── error.rs             # Error types (thiserror)
 │   ├── logging.rs           # Tracing setup
 │   ├── protocol.rs          # Protocol types
 │   └── watcher_types.rs     # Watcher config & shared types
+├── transport/               # Transport abstraction (10 files, ~2200 lines)
+│   ├── mod.rs               # Transport trait, re-exports
+│   ├── events.rs            # AgentEvent enum with 7 top-level variants
+│   ├── bus.rs               # AgentBus — two-tier consumer model
+│   ├── driver.rs            # ConversationDriver — unified conversation loop
+│   ├── stdio.rs             # StdioTransport adapter
+│   ├── websocket.rs         # WebSocketTransport adapter
+│   ├── agent.rs             # AgentHarness with lifecycle management
+│   ├── attach.rs            # NDJSON protocol for connecting to running agents
+│   ├── inbound.rs           # Inbound message types
+│   └── sync.rs              # Session state synchronization
 ├── runtime/                 # Core runtime (6 files)
 │   ├── mod.rs               # Runtime struct, orchestration loop
 │   ├── api.rs               # API communication, SSE streaming, retry
@@ -212,7 +225,7 @@ src/
 │   ├── auth.rs              # Auth state management
 │   ├── helpers.rs           # Shared utilities
 │   └── types.rs             # Internal types
-├── tools/                   # Tool implementations (10 files)
+├── tools/                   # Tool implementations (13 files)
 │   ├── mod.rs               # Tool trait, ToolRegistry, ToolContext
 │   ├── bash.rs              # Shell execution with timeout
 │   ├── read.rs              # File reading (UTF-8 validated)
@@ -223,21 +236,34 @@ src/
 │   ├── ls.rs                # Directory listing
 │   ├── subagent.rs          # Agent dispatch with panic handling
 │   └── watcher_exit.rs      # Handoff for watcher agents
-├── chatui/                  # TUI frontend (6 files)
+├── chatui/                  # TUI frontend (9 files)
 │   ├── main.rs              # Event loop
 │   ├── app.rs               # Application state
 │   ├── draw.rs              # Rendering
 │   ├── markdown.rs          # Markdown renderer (tables, lists, wrapping)
 │   ├── highlight.rs         # Syntax highlighting (syntect)
-│   └── theme.rs             # 18 color themes
+│   ├── theme/               # 18 color themes (2 files)
+│   └── ...
 ├── watcher/                 # Supervisor daemon (4 files)
 │   ├── mod.rs               # Types, CLI dispatch
 │   ├── ipc.rs               # Unix socket communication
 │   ├── supervisor.rs        # Agent spawning, heartbeat, file watching, init
 │   └── display.rs           # Status tables, log viewing
-├── mcp.rs                   # MCP JSON-RPC client
+├── mcp/                     # MCP JSON-RPC client (4 files)
 └── skills.rs                # Skills system
 ```
+
+### Transport System
+
+The transport layer provides a unified event bus and driver architecture:
+
+- **AgentBus**: Two-tier consumer model — Transport trait for simple I/O adapters, direct channels for complex consumers like TUI
+- **ConversationDriver**: Single conversation loop that replaced 4 duplicated implementations, reducing binary sizes significantly
+- **BusHandle**: Clone-able reference for connecting multiple transports and consumers
+- **AgentHarness**: Wraps driver with autonomous agent lifecycle management
+- **Built-in transports**: StdioTransport (headless), WebSocketTransport (server/client)
+
+Adding new interfaces (Discord, Slack, etc.) means implementing the simple Transport trait with `recv()` and `send()` methods.
 
 **Binaries:**
 
