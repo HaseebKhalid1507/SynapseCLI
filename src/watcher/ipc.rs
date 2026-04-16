@@ -273,12 +273,16 @@ pub(crate) async fn handle_ipc_connection(
 }
 
 /// Handle an attached streaming session
-async fn handle_attach(
-    mut buf_reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    mut writer: tokio::net::unix::OwnedWriteHalf,
+async fn handle_attach<R, W>(
+    mut buf_reader: BufReader<R>,
+    mut writer: W,
     bus_handle: synaps_cli::BusHandle,
     mode: String,
-) {
+)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut event_rx = bus_handle.subscribe();
     let inbound_tx = bus_handle.inbound();
     let read_only = mode == "ro";
@@ -366,4 +370,277 @@ pub(crate) async fn send_ipc_command(command: WatcherCommand) -> Result<WatcherR
     
     serde_json::from_str(response_line.trim())
         .map_err(|e| format!("Failed to parse response: {}", e))
+}
+// ---------------------------------------------------------------------------
+// Integration tests for the attach protocol (Phase 7d)
+//
+// These tests exercise `handle_attach` end-to-end using `tokio::io::duplex`
+// as a stand-in for the Unix socket split. They validate the wire contract
+// between an attached client and the in-process agent bus — events flow out,
+// commands flow in, Detach cleans up, read-only mode suppresses inbound,
+// and multiple attached clients see the same event stream.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+    use synaps_cli::{AgentEvent, AttachEvent, AttachInbound};
+    use synaps_cli::transport::{AgentBus, Inbound};
+    use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::time::{timeout, Duration};
+
+    /// Wire an in-memory duplex pair into handle_attach, return the client side
+    /// and a JoinHandle for the handler task.
+    ///
+    /// Returns: (client_reader, client_writer, handler_join, bus)
+    fn spawn_attach_session(
+        mode: &str,
+    ) -> (
+        TokioBufReader<tokio::io::DuplexStream>,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+        AgentBus,
+    ) {
+        let bus = AgentBus::new();
+        let handle = bus.handle();
+
+        // client <-> server duplex pair
+        let (server_r, client_w) = duplex(4096);
+        let (client_r, server_w) = duplex(4096);
+
+        let server_reader = TokioBufReader::new(server_r);
+        let mode = mode.to_string();
+        let join = tokio::spawn(async move {
+            handle_attach(server_reader, server_w, handle, mode).await;
+        });
+
+        (TokioBufReader::new(client_r), client_w, join, bus)
+    }
+
+    /// Helper: read one NDJSON line from the client reader with a timeout,
+    /// parse it as AttachEvent, panic on timeout/parse error.
+    async fn recv_attach_event(
+        client_reader: &mut TokioBufReader<tokio::io::DuplexStream>,
+    ) -> AttachEvent {
+        let mut line = String::new();
+        let n = timeout(Duration::from_secs(2), client_reader.read_line(&mut line))
+            .await
+            .expect("client read timed out")
+            .expect("client read error");
+        assert!(n > 0, "client reader returned EOF");
+        serde_json::from_str(line.trim()).expect("failed to parse AttachEvent")
+    }
+
+    /// Helper: send an AttachInbound as NDJSON to the client writer.
+    async fn send_inbound(
+        client_writer: &mut tokio::io::DuplexStream,
+        inbound: &AttachInbound,
+    ) {
+        let json = serde_json::to_string(inbound).unwrap();
+        client_writer.write_all(json.as_bytes()).await.unwrap();
+        client_writer.write_all(b"\n").await.unwrap();
+        client_writer.flush().await.unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 1: Bus event flows out to the attached client as AttachEvent::Event
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_event_flows_out_to_client() {
+        let (mut client_r, _client_w, join, bus) = spawn_attach_session("rw");
+
+        // Give the handler time to subscribe to the bus
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        bus.broadcast(AgentEvent::Text("hello from bus".to_string()));
+
+        let ev = recv_attach_event(&mut client_r).await;
+        match ev {
+            AttachEvent::Event { event: AgentEvent::Text(t) } => {
+                assert_eq!(t, "hello from bus");
+            }
+            other => panic!("expected Event(Text), got {:?}", other),
+        }
+
+        join.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 2: Client Message flows through to the bus inbound channel
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_client_message_reaches_bus_inbound() {
+        let (_client_r, mut client_w, join, mut bus) = spawn_attach_session("rw");
+        let mut inbound_rx = bus.take_inbound_rx().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        send_inbound(&mut client_w, &AttachInbound::Message { content: "ping".into() }).await;
+
+        let received = timeout(Duration::from_secs(2), inbound_rx.recv())
+            .await
+            .expect("inbound_rx timed out")
+            .expect("inbound_rx closed");
+        match received {
+            Inbound::Message { content } => assert_eq!(content, "ping"),
+            other => panic!("expected Inbound::Message, got {:?}", other),
+        }
+
+        join.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 3: Client Cancel reaches bus inbound as Inbound::Cancel
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_client_cancel_reaches_bus_inbound() {
+        let (_client_r, mut client_w, join, mut bus) = spawn_attach_session("rw");
+        let mut inbound_rx = bus.take_inbound_rx().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        send_inbound(&mut client_w, &AttachInbound::Cancel).await;
+
+        let received = timeout(Duration::from_secs(2), inbound_rx.recv())
+            .await
+            .expect("inbound_rx timed out")
+            .expect("inbound_rx closed");
+        assert!(matches!(received, Inbound::Cancel), "expected Inbound::Cancel, got {:?}", received);
+
+        join.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 4: Client Detach causes handle_attach to return cleanly
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_detach_ends_session() {
+        let (_client_r, mut client_w, join, _bus) = spawn_attach_session("rw");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        send_inbound(&mut client_w, &AttachInbound::Detach).await;
+
+        // Give the handler a moment to notice and return
+        let result = timeout(Duration::from_secs(2), join).await;
+        assert!(result.is_ok(), "handle_attach did not return within 2s of Detach");
+        // And it should have returned normally (not panicked)
+        assert!(result.unwrap().is_ok(), "handle_attach task panicked");
+    }
+
+    // -------------------------------------------------------------------
+    // Test 5: Read-only mode suppresses inbound traffic
+    // In ro mode, client-side writes should NOT reach the bus inbound,
+    // but events should still flow out to the client.
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_readonly_suppresses_inbound() {
+        let (mut client_r, mut client_w, join, mut bus) = spawn_attach_session("ro");
+        let mut inbound_rx = bus.take_inbound_rx().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Events still flow out
+        bus.broadcast(AgentEvent::Text("visible".to_string()));
+        let ev = recv_attach_event(&mut client_r).await;
+        assert!(matches!(ev, AttachEvent::Event { .. }));
+
+        // But client's inbound is ignored — even if the bytes arrive, no Inbound is produced
+        send_inbound(&mut client_w, &AttachInbound::Message { content: "should be dropped".into() }).await;
+
+        let res = timeout(Duration::from_millis(300), inbound_rx.recv()).await;
+        assert!(res.is_err(), "ro mode must not forward inbound messages, got {:?}", res);
+
+        join.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 6: Two attached clients both see the same bus event
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_multi_attach_fanout() {
+        let bus = AgentBus::new();
+        let h1 = bus.handle();
+        let h2 = bus.handle();
+
+        let (s1_r, c1_w) = duplex(4096);
+        let (c1_r, s1_w) = duplex(4096);
+        let (s2_r, c2_w) = duplex(4096);
+        let (c2_r, s2_w) = duplex(4096);
+
+        let j1 = tokio::spawn(async move {
+            handle_attach(TokioBufReader::new(s1_r), s1_w, h1, "rw".to_string()).await;
+        });
+        let j2 = tokio::spawn(async move {
+            handle_attach(TokioBufReader::new(s2_r), s2_w, h2, "rw".to_string()).await;
+        });
+
+        // Unused writers — keep alive
+        let _ = c1_w;
+        let _ = c2_w;
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        bus.broadcast(AgentEvent::Text("shared".to_string()));
+
+        let mut r1 = TokioBufReader::new(c1_r);
+        let mut r2 = TokioBufReader::new(c2_r);
+        let ev1 = recv_attach_event(&mut r1).await;
+        let ev2 = recv_attach_event(&mut r2).await;
+
+        for ev in [ev1, ev2] {
+            match ev {
+                AttachEvent::Event { event: AgentEvent::Text(t) } => assert_eq!(t, "shared"),
+                other => panic!("expected Event(Text), got {:?}", other),
+            }
+        }
+
+        j1.abort();
+        j2.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 7: EOF on client side ends the session
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_eof_ends_session() {
+        let (_client_r, client_w, join, _bus) = spawn_attach_session("rw");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Drop the client's writer — server sees EOF on read_line
+        drop(client_w);
+
+        let result = timeout(Duration::from_secs(2), join).await;
+        assert!(result.is_ok(), "handle_attach did not return within 2s of client EOF");
+        assert!(result.unwrap().is_ok(), "handle_attach task panicked on EOF");
+    }
+
+    // -------------------------------------------------------------------
+    // Test 8: Malformed inbound JSON is ignored (not fatal)
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_malformed_inbound_ignored() {
+        let (_client_r, mut client_w, join, mut bus) = spawn_attach_session("rw");
+        let mut inbound_rx = bus.take_inbound_rx().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Send garbage — not a valid AttachInbound
+        client_w.write_all(b"{not valid json}\n").await.unwrap();
+        client_w.flush().await.unwrap();
+
+        // Should not appear on the inbound channel
+        let res = timeout(Duration::from_millis(200), inbound_rx.recv()).await;
+        assert!(res.is_err(), "malformed JSON must not produce an Inbound, got {:?}", res);
+
+        // Session should still be alive — send a valid message and confirm it works
+        send_inbound(&mut client_w, &AttachInbound::Message { content: "after garbage".into() }).await;
+        let received = timeout(Duration::from_secs(2), inbound_rx.recv())
+            .await
+            .expect("inbound_rx timed out after valid message")
+            .expect("inbound_rx closed");
+        assert!(matches!(received, Inbound::Message { .. }));
+
+        join.abort();
+    }
 }
