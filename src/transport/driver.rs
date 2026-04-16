@@ -54,12 +54,13 @@ pub struct ConversationDriver {
 }
 
 impl ConversationDriver {
-    pub fn new(runtime: Runtime, session: Session, config: DriverConfig) -> Self {
+    pub fn new(runtime: Runtime, mut session: Session, config: DriverConfig) -> Self {
+        let messages = std::mem::take(&mut session.api_messages);
         Self {
             runtime,
             bus: AgentBus::new(),
             config,
-            messages: Vec::new(),
+            messages,
             session,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -119,7 +120,7 @@ impl ConversationDriver {
         while let Some(inbound) = inbound_rx.recv().await {
             match inbound {
                 Inbound::Message { content } => {
-                    self.handle_user_message(content).await?;
+                    self.handle_user_message(content, &mut inbound_rx).await?;
                 }
                 Inbound::Steer { content } => {
                     if let Some(ref tx) = self.steer_tx {
@@ -143,8 +144,13 @@ impl ConversationDriver {
     }
 
     /// Inject a user message programmatically (e.g. agent boot messages).
+    /// Note: does not drain inbound during streaming — use bus Inbound::Message
+    /// for interactive contexts where abort/steer must work.
     pub async fn inject_user_message(&mut self, content: String) -> crate::Result<()> {
-        self.handle_user_message(content).await
+        // Create a dummy receiver — inject_user_message doesn't support
+        // mid-stream cancel/steer since there's no inbound channel to drain.
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        self.handle_user_message(content, &mut rx).await
     }
 
     /// Broadcast shutdown and cancel any active stream.
@@ -155,7 +161,11 @@ impl ConversationDriver {
         }
     }
 
-    async fn handle_user_message(&mut self, content: String) -> crate::Result<()> {
+    async fn handle_user_message(
+        &mut self,
+        content: String,
+        inbound_rx: &mut mpsc::UnboundedReceiver<Inbound>,
+    ) -> crate::Result<()> {
         // Push user message
         self.messages.push(json!({"role": "user", "content": content}));
 
@@ -177,122 +187,37 @@ impl ConversationDriver {
             .run_stream_with_messages(self.messages.clone(), cancel, Some(steer_rx))
             .await;
 
-        while let Some(event) = stream.next().await {
-            match event {
-                StreamEvent::Text(ref t) => {
-                    self.partial_text.push_str(t);
-                    self.emit(AgentEvent::Text(t.clone()));
-                }
-                StreamEvent::Thinking(ref t) => {
-                    self.partial_thinking.push_str(t);
-                    self.emit(AgentEvent::Thinking(t.clone()));
-                }
-                StreamEvent::ToolUseStart(ref name) => {
-                    self.tool_call_count += 1;
-                    self.tool_start_time = Some(Instant::now());
-                    self.active_tool = Some(name.clone());
-                    self.emit(AgentEvent::Tool(ToolEvent::Start {
-                        tool_name: name.clone(),
-                        tool_id: String::new(),
-                    }));
-                }
-                StreamEvent::ToolUseDelta(ref d) => {
-                    self.emit(AgentEvent::Tool(ToolEvent::ArgsDelta(d.clone())));
-                }
-                StreamEvent::ToolUse { ref tool_name, ref tool_id, ref input } => {
-                    self.emit(AgentEvent::Tool(ToolEvent::Invoke {
-                        tool_name: tool_name.clone(),
-                        tool_id: tool_id.clone(),
-                        input: input.clone(),
-                    }));
-                }
-                StreamEvent::ToolResultDelta { ref tool_id, ref delta } => {
-                    self.emit(AgentEvent::Tool(ToolEvent::OutputDelta {
-                        tool_id: tool_id.clone(),
-                        delta: delta.clone(),
-                    }));
-                }
-                StreamEvent::ToolResult { ref tool_id, ref result } => {
-                    let elapsed_ms = self.tool_start_time.take()
-                        .map(|t| t.elapsed().as_millis() as u64);
-                    self.active_tool = None;
-                    self.emit(AgentEvent::Tool(ToolEvent::Complete {
-                        tool_id: tool_id.clone(),
-                        result: result.clone(),
-                        elapsed_ms,
-                    }));
-                }
-                StreamEvent::SubagentStart { subagent_id, ref agent_name, ref task_preview } => {
-                    self.emit(AgentEvent::Subagent(SubagentEvent::Start {
-                        id: subagent_id,
-                        agent_name: agent_name.clone(),
-                        task_preview: task_preview.clone(),
-                    }));
-                }
-                StreamEvent::SubagentUpdate { subagent_id, ref agent_name, ref status } => {
-                    self.emit(AgentEvent::Subagent(SubagentEvent::Update {
-                        id: subagent_id,
-                        agent_name: agent_name.clone(),
-                        status: status.clone(),
-                    }));
-                }
-                StreamEvent::SubagentDone { subagent_id, ref agent_name, ref result_preview, duration_secs } => {
-                    self.emit(AgentEvent::Subagent(SubagentEvent::Done {
-                        id: subagent_id,
-                        agent_name: agent_name.clone(),
-                        result_preview: result_preview.clone(),
-                        duration_secs,
-                    }));
-                }
-                StreamEvent::SteeringDelivered { ref message } => {
-                    self.emit(AgentEvent::Meta(MetaEvent::Steered { message: message.clone() }));
-                }
-                StreamEvent::Usage { input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, ref model } => {
-                    let model_str = model.as_deref().unwrap_or(self.runtime.model());
-                    let cost = estimate_cost(input_tokens, output_tokens, model_str);
-                    self.total_input_tokens += input_tokens;
-                    self.total_output_tokens += output_tokens;
-                    self.total_cost_usd += cost;
-                    self.emit(AgentEvent::Meta(MetaEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                        cache_read_tokens: cache_read_input_tokens,
-                        cache_creation_tokens: cache_creation_input_tokens,
-                        model: model_str.to_string(),
-                        cost_usd: cost,
-                    }));
-                }
-                StreamEvent::MessageHistory(h) => {
-                    self.messages = h;
-                    if self.config.auto_save {
-                        self.save_session().await;
+        // Select on both stream events AND inbound commands so that
+        // Cancel and Steer are processed while the stream is active.
+        // Without this, Esc (abort) and mid-stream steering are dead
+        // because the outer run() loop isn't polled during streaming.
+        loop {
+            tokio::select! {
+                event = stream.next() => {
+                    match event {
+                        Some(event) => self.handle_stream_event(event).await,
+                        None => break,
                     }
-                    // Broadcast to TUI so app.api_messages stays in sync
-                    self.emit(AgentEvent::MessageHistory(self.messages.clone()));
                 }
-                StreamEvent::Done => {
-                    self.turn_count += 1;
-                    self.emit(AgentEvent::Meta(MetaEvent::SessionStats {
-                        total_input_tokens: self.total_input_tokens,
-                        total_output_tokens: self.total_output_tokens,
-                        total_cost_usd: self.total_cost_usd,
-                        turn_count: self.turn_count,
-                        tool_call_count: self.tool_call_count,
-                    }));
-                    self.emit(AgentEvent::TurnComplete);
-                }
-                StreamEvent::Error(ref e) => {
-                    // Clean up trailing broken messages
-                    if let Some(last) = self.messages.last() {
-                        let role = last["role"].as_str().unwrap_or("");
-                        let is_text_user = role == "user" && last["content"].is_string();
-                        let is_assistant = role == "assistant";
-                        if is_text_user || is_assistant {
-                            self.messages.pop();
+                Some(inbound) = inbound_rx.recv() => {
+                    match inbound {
+                        Inbound::Cancel => {
+                            if let Some(ref ct) = self.cancel {
+                                ct.cancel();
+                            }
                         }
+                        Inbound::Steer { content } => {
+                            if let Some(ref tx) = self.steer_tx {
+                                let _ = tx.send(content);
+                            }
+                        }
+                        Inbound::Command { name, args } => {
+                            self.handle_command(&name, &args);
+                        }
+                        // Messages arriving during streaming are ignored —
+                        // the TUI queues them and resends after TurnComplete.
+                        _ => {}
                     }
-                    self.emit(AgentEvent::Error(e.clone()));
-                    self.emit(AgentEvent::TurnComplete);
                 }
             }
         }
@@ -301,6 +226,126 @@ impl ConversationDriver {
         self.cancel = None;
         self.steer_tx = None;
         Ok(())
+    }
+
+    async fn handle_stream_event(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::Text(ref t) => {
+                self.partial_text.push_str(t);
+                self.emit(AgentEvent::Text(t.clone()));
+            }
+            StreamEvent::Thinking(ref t) => {
+                self.partial_thinking.push_str(t);
+                self.emit(AgentEvent::Thinking(t.clone()));
+            }
+            StreamEvent::ToolUseStart(ref name) => {
+                self.tool_call_count += 1;
+                self.tool_start_time = Some(Instant::now());
+                self.active_tool = Some(name.clone());
+                self.emit(AgentEvent::Tool(ToolEvent::Start {
+                    tool_name: name.clone(),
+                    tool_id: String::new(),
+                }));
+            }
+            StreamEvent::ToolUseDelta(ref d) => {
+                self.emit(AgentEvent::Tool(ToolEvent::ArgsDelta(d.clone())));
+            }
+            StreamEvent::ToolUse { ref tool_name, ref tool_id, ref input } => {
+                self.emit(AgentEvent::Tool(ToolEvent::Invoke {
+                    tool_name: tool_name.clone(),
+                    tool_id: tool_id.clone(),
+                    input: input.clone(),
+                }));
+            }
+            StreamEvent::ToolResultDelta { ref tool_id, ref delta } => {
+                self.emit(AgentEvent::Tool(ToolEvent::OutputDelta {
+                    tool_id: tool_id.clone(),
+                    delta: delta.clone(),
+                }));
+            }
+            StreamEvent::ToolResult { ref tool_id, ref result } => {
+                let elapsed_ms = self.tool_start_time.take()
+                    .map(|t| t.elapsed().as_millis() as u64);
+                self.active_tool = None;
+                self.emit(AgentEvent::Tool(ToolEvent::Complete {
+                    tool_id: tool_id.clone(),
+                    result: result.clone(),
+                    elapsed_ms,
+                }));
+            }
+            StreamEvent::SubagentStart { subagent_id, ref agent_name, ref task_preview } => {
+                self.emit(AgentEvent::Subagent(SubagentEvent::Start {
+                    id: subagent_id,
+                    agent_name: agent_name.clone(),
+                    task_preview: task_preview.clone(),
+                }));
+            }
+            StreamEvent::SubagentUpdate { subagent_id, ref agent_name, ref status } => {
+                self.emit(AgentEvent::Subagent(SubagentEvent::Update {
+                    id: subagent_id,
+                    agent_name: agent_name.clone(),
+                    status: status.clone(),
+                }));
+            }
+            StreamEvent::SubagentDone { subagent_id, ref agent_name, ref result_preview, duration_secs } => {
+                self.emit(AgentEvent::Subagent(SubagentEvent::Done {
+                    id: subagent_id,
+                    agent_name: agent_name.clone(),
+                    result_preview: result_preview.clone(),
+                    duration_secs,
+                }));
+            }
+            StreamEvent::SteeringDelivered { ref message } => {
+                self.emit(AgentEvent::Meta(MetaEvent::Steered { message: message.clone() }));
+            }
+            StreamEvent::Usage { input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, ref model } => {
+                let model_str = model.as_deref().unwrap_or(self.runtime.model());
+                let cost = estimate_cost(input_tokens, output_tokens, model_str);
+                self.total_input_tokens += input_tokens;
+                self.total_output_tokens += output_tokens;
+                self.total_cost_usd += cost;
+                self.emit(AgentEvent::Meta(MetaEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens: cache_read_input_tokens,
+                    cache_creation_tokens: cache_creation_input_tokens,
+                    model: model_str.to_string(),
+                    cost_usd: cost,
+                }));
+            }
+            StreamEvent::MessageHistory(h) => {
+                self.messages = h;
+                if self.config.auto_save {
+                    self.save_session().await;
+                }
+                // Broadcast to TUI so app.api_messages stays in sync
+                self.emit(AgentEvent::MessageHistory(self.messages.clone()));
+            }
+            StreamEvent::Done => {
+                self.turn_count += 1;
+                self.emit(AgentEvent::Meta(MetaEvent::SessionStats {
+                    total_input_tokens: self.total_input_tokens,
+                    total_output_tokens: self.total_output_tokens,
+                    total_cost_usd: self.total_cost_usd,
+                    turn_count: self.turn_count,
+                    tool_call_count: self.tool_call_count,
+                }));
+                self.emit(AgentEvent::TurnComplete);
+            }
+            StreamEvent::Error(ref e) => {
+                // Clean up trailing broken messages
+                if let Some(last) = self.messages.last() {
+                    let role = last["role"].as_str().unwrap_or("");
+                    let is_text_user = role == "user" && last["content"].is_string();
+                    let is_assistant = role == "assistant";
+                    if is_text_user || is_assistant {
+                        self.messages.pop();
+                    }
+                }
+                self.emit(AgentEvent::Error(e.clone()));
+                self.emit(AgentEvent::TurnComplete);
+            }
+        }
     }
 
     fn handle_command(&mut self, name: &str, args: &str) {
