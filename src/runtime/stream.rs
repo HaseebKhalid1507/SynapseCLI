@@ -38,6 +38,7 @@ pub(super) struct StreamSession {
     pub(super) session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     pub(super) subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     pub(super) event_queue: Arc<crate::events::EventQueue>,
+    pub(super) tmux_controller: Option<std::sync::Arc<crate::tmux::TmuxController>>,
 }
 
 pub(super) struct StreamMethods;
@@ -54,6 +55,7 @@ impl StreamMethods {
             watcher_exit_path, max_tool_output,
             bash_timeout, bash_max_timeout, subagent_timeout,
             session_manager, subagent_registry, event_queue,
+            tmux_controller,
         } = session;
         let mut messages = initial_messages;
 
@@ -196,7 +198,7 @@ impl StreamMethods {
                                 tokio::select! {
                                     res = tool.execute(input, crate::ToolContext {
                                         channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                        capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), tmux_controller: None },
+                                        capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), tmux_controller: tmux_controller.clone() },
                                         limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
                                     }) => {
                                         match res {
@@ -258,6 +260,7 @@ impl StreamMethods {
                         let session_mgr = session_manager.clone();
                         let registry_inner = subagent_registry.clone();
                         let eq_inner = event_queue.clone();
+                        let tmux_ctrl_inner = tmux_controller.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
@@ -277,7 +280,7 @@ impl StreamMethods {
                                     tokio::select! {
                                         res = t.execute(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), tmux_controller: None },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), tmux_controller: tmux_ctrl_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             match res {

@@ -514,6 +514,7 @@ impl Runtime {
         // Anthropic's claude-code default and gives smarter inference.
         let subagent_registry = self.subagent_registry.clone();
         let event_queue = self.event_queue.clone();
+        let tmux_controller = self.tmux_controller.clone();
         let options = api::ApiOptions {
             use_1m_context: self.context_window_override == Some(1_000_000),
         };
@@ -525,6 +526,7 @@ impl Runtime {
             watcher_exit_path, max_tool_output,
             bash_timeout, bash_max_timeout, subagent_timeout,
             session_manager, subagent_registry, event_queue,
+            tmux_controller,
         };
 
         tokio::spawn(async move {

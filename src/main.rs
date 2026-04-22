@@ -96,7 +96,38 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => {
-            chatui::run(cli.continue_session, cli.system, cli.profile).await?;
+            // Resolve tmux controller if --tmux flag was passed
+            let tmux_controller = if cli.tmux.is_some() {
+                // Ensure tmux binary is available
+                if synaps_cli::tmux::find_tmux().is_none() {
+                    if synaps_cli::tmux::install::prompt_install() {
+                        if let Err(e) = synaps_cli::tmux::install::run_install().await {
+                            eprintln!("tmux installation failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    } else {
+                        eprintln!("error: tmux is required for --tmux mode but was not found");
+                        std::process::exit(1);
+                    }
+                }
+
+                // Resolve session name: explicit name or auto-generated
+                let session_name = match cli.tmux {
+                    Some(Some(name)) => name,
+                    _ => synaps_cli::tmux::auto_session_name(),
+                };
+
+                let mut tmux_ctrl = synaps_cli::tmux::TmuxController::new(session_name);
+                if let Err(e) = tmux_ctrl.start().await {
+                    eprintln!("error: failed to start tmux session: {}", e);
+                    std::process::exit(1);
+                }
+                Some(std::sync::Arc::new(tmux_ctrl))
+            } else {
+                None
+            };
+
+            chatui::run(cli.continue_session, cli.system, cli.profile, tmux_controller).await?;
         }
         Some(Command::Run { prompt, agent, system }) => {
             cmd::run::run(prompt, agent, system).await?;
