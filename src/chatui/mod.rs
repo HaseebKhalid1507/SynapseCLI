@@ -179,6 +179,7 @@ pub async fn run(
     continue_session: Option<Option<String>>,
     system: Option<String>,
     profile: Option<String>,
+    tmux_controller: Option<std::sync::Arc<synaps_cli::tmux::TmuxController>>,
 ) -> Result<()> {
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
@@ -190,6 +191,11 @@ pub async fn run(
     // Load config and apply
     let mut config = synaps_cli::config::load_config();
     runtime.apply_config(&config);
+
+    // Wire tmux controller if active
+    if let Some(ref ctrl) = tmux_controller {
+        runtime.set_tmux_controller(std::sync::Arc::clone(ctrl));
+    }
 
     // Load system prompt
     let system_prompt = synaps_cli::config::resolve_system_prompt(system.as_deref());
@@ -1004,6 +1010,8 @@ pub async fn run(
 
     // Save session on exit
     app.save_session().await;
+
+    // tmux session cleanup is handled by TmuxSessionGuard in main.rs (Drop on exit)
 
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
