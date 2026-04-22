@@ -54,6 +54,8 @@ pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> Inpu
         }
         KeyCode::Char('r') if matches!(state.focus, Focus::Left) => refresh_selected_marketplace(state),
         KeyCode::Char('R') if matches!(state.focus, Focus::Left) => ask_remove_marketplace(state),
+        KeyCode::Char('r') if matches!(state.focus, Focus::Right) => refresh_selected_marketplace(state),
+        KeyCode::Char('R') if matches!(state.focus, Focus::Right) => ask_remove_marketplace(state),
         _ => InputOutcome::None,
     }
 }
@@ -454,6 +456,34 @@ mod tests {
             RightMode::Confirm { prompt, on_yes } => {
                 assert!(prompt.contains("tools"), "prompt should mention plugin name, got: {}", prompt);
                 assert!(matches!(on_yes, ConfirmAction::Uninstall(n) if n == "tools"));
+            }
+            other => panic!("expected Confirm dialog, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn remove_marketplace_from_right_pane() {
+        use synaps_cli::skills::state::Marketplace;
+        use crate::chatui::plugins::state::{RightMode, ConfirmAction};
+        let mut file = PluginsState::default();
+        file.marketplaces.push(Marketplace {
+            name: "mp".into(),
+            url: "https://example/mp".into(),
+            description: None,
+            last_refreshed: None,
+            cached_plugins: vec![],
+            repo_url: None,
+        });
+        let mut s = crate::chatui::plugins::PluginsModalState::new(file);
+        s.selected_left = 1; // marketplace row
+        s.focus = crate::chatui::plugins::state::Focus::Right;
+
+        // Press R from right pane — should still open remove confirm
+        handle_event(&mut s, KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        match &s.mode {
+            RightMode::Confirm { prompt, on_yes } => {
+                assert!(prompt.contains("mp"), "prompt should mention marketplace name, got: {}", prompt);
+                assert!(matches!(on_yes, ConfirmAction::RemoveMarketplace(n) if n == "mp"));
             }
             other => panic!("expected Confirm dialog, got {:?}", other),
         }
