@@ -118,12 +118,12 @@ async fn show_dashboard() {
             let cursor_char = if sel { "▸" } else { " " };
             if sel {
                 let line = format!("   \x1b[1;36m{} {}\x1b[0m", cursor_char, item.label);
-                // visible: 3 spaces + arrow + space + label
-                let vlen = 3 + 2 + 1 + item.label.len();
+                // visible: 3 spaces + arrow(1) + space + label
+                let vlen = 3 + 1 + 1 + item.label.len();
                 box_line(&mut stderr, &line, vlen);
             } else {
                 let line = format!("   {} {}", cursor_char, item.label);
-                let vlen = 3 + 2 + 1 + item.label.len();
+                let vlen = 3 + 1 + 1 + item.label.len();
                 box_line(&mut stderr, &line, vlen);
             }
             // Status line (contains ANSI escapes — compute visible length manually)
