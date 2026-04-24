@@ -171,3 +171,170 @@ pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCre
 
     Ok(new_creds)
 }
+
+/// Exchange an authorization code for OpenAI access + refresh tokens.
+pub async fn exchange_code_for_tokens_openai(
+    code: &str,
+    state: &str,
+    verifier: &str,
+    port: u16,
+) -> std::result::Result<OAuthCredentials, String> {
+    let redirect_uri = format!("http://localhost:{}{}", port, super::OPENAI_CALLBACK_PATH);
+
+    let body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "client_id": super::OPENAI_CLIENT_ID,
+        "code": code,
+        "state": state,
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+    });
+
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let resp = client
+        .post(super::OPENAI_TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI token exchange request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI token exchange failed ({}): {}", status, text));
+    }
+
+    let token_resp: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OpenAI token response: {}", e))?;
+
+    let expires = now_millis() + (token_resp.expires_in * 1000) - (5 * 60 * 1000);
+
+    Ok(OAuthCredentials {
+        auth_type: "oauth".to_string(),
+        refresh: token_resp.refresh_token,
+        access: token_resp.access_token,
+        expires,
+    })
+}
+
+/// Refresh an expired OpenAI OAuth token.
+pub async fn refresh_openai_token(client: &Client, refresh: &str) -> std::result::Result<OAuthCredentials, String> {
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "client_id": super::OPENAI_CLIENT_ID,
+        "refresh_token": refresh,
+    });
+
+    let resp = client
+        .post(super::OPENAI_TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI token refresh request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI token refresh failed ({}): {}", status, text));
+    }
+
+    let token_resp: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OpenAI refresh response: {}", e))?;
+
+    let expires = now_millis() + (token_resp.expires_in * 1000) - (5 * 60 * 1000);
+
+    Ok(OAuthCredentials {
+        auth_type: "oauth".to_string(),
+        refresh: token_resp.refresh_token,
+        access: token_resp.access_token,
+        expires,
+    })
+}
+
+/// Ensure the OpenAI OAuth token is fresh. File-locks auth.json for cross-process safety.
+pub async fn ensure_fresh_openai_token(client: &Client) -> std::result::Result<OAuthCredentials, String> {
+    use fs4::fs_std::FileExt;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let path = auth_file_path();
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+
+    if !path.exists() {
+        return Err(format!(
+            "No credentials at {}. Run `login --provider openai` to authenticate.",
+            path.display()
+        ));
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+
+    let mut file = tokio::task::spawn_blocking(move || -> std::result::Result<std::fs::File, String> {
+        FileExt::lock_exclusive(&file)
+            .map_err(|e| format!("Failed to lock auth.json: {}", e))?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| format!("Lock task failed: {}", e))??;
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Failed to seek auth.json: {}", e))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|e| format!("Failed to read auth.json: {}", e))?;
+
+    let auth: AuthFile = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse auth.json: {}", e))?;
+
+    let openai_creds = auth.openai.ok_or("No OpenAI credentials in auth.json")?;
+
+    if !is_token_expired(&openai_creds) {
+        return Ok(openai_creds);
+    }
+
+    let new_creds = refresh_openai_token(client, &openai_creds.refresh).await?;
+
+    let new_auth = AuthFile {
+        anthropic: auth.anthropic,
+        openai: Some(new_creds.clone()),
+    };
+    let new_json = serde_json::to_string_pretty(&new_auth)
+        .map_err(|e| format!("Failed to serialize auth: {}", e))?;
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Failed to seek for write: {}", e))?;
+    file.set_len(0)
+        .map_err(|e| format!("Failed to truncate auth.json: {}", e))?;
+    file.write_all(new_json.as_bytes())
+        .map_err(|e| format!("Failed to write auth.json: {}", e))?;
+    file.sync_all()
+        .map_err(|e| format!("Failed to fsync auth.json: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(new_creds)
+}
