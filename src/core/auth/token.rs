@@ -175,20 +175,21 @@ pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCre
 /// Exchange an authorization code for OpenAI access + refresh tokens.
 pub async fn exchange_code_for_tokens_openai(
     code: &str,
-    state: &str,
+    _state: &str,
     verifier: &str,
     port: u16,
 ) -> std::result::Result<OAuthCredentials, String> {
     let redirect_uri = format!("http://localhost:{}{}", port, super::OPENAI_CALLBACK_PATH);
 
-    let body = serde_json::json!({
-        "grant_type": "authorization_code",
-        "client_id": super::OPENAI_CLIENT_ID,
-        "code": code,
-        "state": state,
-        "redirect_uri": redirect_uri,
-        "code_verifier": verifier,
-    });
+    // OpenAI's token endpoint expects form-urlencoded (not JSON) and does not
+    // accept a `state` parameter — state is only used during the authorize step.
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("client_id", super::OPENAI_CLIENT_ID),
+        ("code", code),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("code_verifier", verifier),
+    ];
 
     let client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -197,9 +198,8 @@ pub async fn exchange_code_for_tokens_openai(
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
     let resp = client
         .post(super::OPENAI_TOKEN_URL)
-        .header("Content-Type", "application/json")
         .header("Accept", "application/json")
-        .json(&body)
+        .form(&params)
         .send()
         .await
         .map_err(|e| format!("OpenAI token exchange request failed: {}", e))?;
@@ -227,17 +227,16 @@ pub async fn exchange_code_for_tokens_openai(
 
 /// Refresh an expired OpenAI OAuth token.
 pub async fn refresh_openai_token(client: &Client, refresh: &str) -> std::result::Result<OAuthCredentials, String> {
-    let body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "client_id": super::OPENAI_CLIENT_ID,
-        "refresh_token": refresh,
-    });
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("client_id", super::OPENAI_CLIENT_ID),
+        ("refresh_token", refresh),
+    ];
 
     let resp = client
         .post(super::OPENAI_TOKEN_URL)
-        .header("Content-Type", "application/json")
         .header("Accept", "application/json")
-        .json(&body)
+        .form(&params)
         .send()
         .await
         .map_err(|e| format!("OpenAI token refresh request failed: {}", e))?;

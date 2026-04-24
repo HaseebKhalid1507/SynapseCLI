@@ -43,7 +43,7 @@ pub(super) const OPENAI_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/aut
 pub(super) const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub(super) const OPENAI_CALLBACK_PORT: u16 = 1455;
 pub(super) const OPENAI_CALLBACK_PATH: &str = "/auth/callback";
-pub(super) const OPENAI_SCOPES: &str = "openid profile email offline_access";
+pub(super) const OPENAI_SCOPES: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 

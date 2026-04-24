@@ -23,14 +23,16 @@ pub fn providers() -> &'static [ProviderSpec] {
             name: "OpenAI",
             base_url: "https://api.openai.com/v1",
             env_vars: &["OPENAI_API_KEY"],
-            default_model: "gpt-4.1",
+            default_model: "gpt-5.5",
             models: &[
+                ("gpt-5.5", "GPT-5.5", "S++"),
+                ("gpt-5.4", "GPT-5.4", "S+"),
+                ("gpt-5.2", "GPT-5.2", "S"),
                 ("gpt-4.1", "GPT-4.1", "A+"),
                 ("gpt-4.1-mini", "GPT-4.1 Mini", "B+"),
                 ("gpt-4.1-nano", "GPT-4.1 Nano", "B"),
                 ("o3", "o3", "S+"),
                 ("o4-mini", "o4-mini", "A+"),
-                ("codex-mini", "Codex Mini", "A"),
             ],
         },
         ProviderSpec {
