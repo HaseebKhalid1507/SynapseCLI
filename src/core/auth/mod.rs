@@ -34,6 +34,14 @@ pub(super) const CALLBACK_HOST: &str = "127.0.0.1";
 pub(super) const CALLBACK_PORT: u16 = 53692;
 pub(super) const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
+// ── OpenAI Constants ──────────────────────────────────────────────────────
+pub(super) const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub(super) const OPENAI_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+pub(super) const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub(super) const OPENAI_CALLBACK_PORT: u16 = 1455;
+pub(super) const OPENAI_CALLBACK_PATH: &str = "/auth/callback";
+pub(super) const OPENAI_SCOPES: &str = "openid profile email offline_access";
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +56,8 @@ pub struct OAuthCredentials {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthFile {
     pub anthropic: OAuthCredentials,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai: Option<OAuthCredentials>,
 }
 
 #[derive(Debug, Deserialize)]

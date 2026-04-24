@@ -149,6 +149,7 @@ pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCre
 
     let new_auth = AuthFile {
         anthropic: new_creds.clone(),
+        openai: auth.openai,
     };
     let new_json = serde_json::to_string_pretty(&new_auth)
         .map_err(|e| format!("Failed to serialize auth: {}", e))?;

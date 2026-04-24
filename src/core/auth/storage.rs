@@ -32,6 +32,7 @@ pub fn save_auth(creds: &OAuthCredentials) -> std::result::Result<(), String> {
 
     let auth = AuthFile {
         anthropic: creds.clone(),
+        openai: None,
     };
 
     let json = serde_json::to_string_pretty(&auth)
@@ -50,4 +51,60 @@ pub fn save_auth(creds: &OAuthCredentials) -> std::result::Result<(), String> {
     }
 
     Ok(())
+}
+
+pub fn save_openai_auth(creds: &OAuthCredentials) -> std::result::Result<(), String> {
+    let path = crate::config::resolve_write_path("auth.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+
+    // Load existing auth or create a stub
+    let mut auth = if path.exists() {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        serde_json::from_str::<AuthFile>(&content)
+            .unwrap_or_else(|_| AuthFile {
+                anthropic: OAuthCredentials {
+                    auth_type: "none".to_string(),
+                    refresh: String::new(),
+                    access: String::new(),
+                    expires: 0,
+                },
+                openai: None,
+            })
+    } else {
+        AuthFile {
+            anthropic: OAuthCredentials {
+                auth_type: "none".to_string(),
+                refresh: String::new(),
+                access: String::new(),
+                expires: 0,
+            },
+            openai: None,
+        }
+    };
+
+    auth.openai = Some(creds.clone());
+
+    let json = serde_json::to_string_pretty(&auth)
+        .map_err(|e| format!("Failed to serialize auth: {}", e))?;
+    std::fs::write(&path, &json)
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&path, perms)
+            .map_err(|e| format!("Failed to set permissions on {}: {}", path.display(), e))?;
+    }
+
+    Ok(())
+}
+
+pub fn load_openai_auth() -> std::result::Result<Option<OAuthCredentials>, String> {
+    let auth = load_auth()?;
+    Ok(auth.and_then(|a| a.openai))
 }
