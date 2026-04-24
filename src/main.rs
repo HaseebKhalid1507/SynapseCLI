@@ -65,7 +65,11 @@ enum Command {
         args: Vec<String>,
     },
     /// OAuth login
-    Login,
+    Login {
+        /// Which provider to log into (anthropic, openai). Omit for interactive dashboard.
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Show account usage and reset times
     Status,
     /// Send an event to the inbox (picked up by running session)
@@ -112,8 +116,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Watcher { subcommand, args }) => {
             cmd::watcher::run(subcommand, args).await;
         }
-        Some(Command::Login) => {
-            cmd::login::run(cli.profile).await;
+        Some(Command::Login { provider }) => {
+            cmd::login::run(cli.profile, provider).await;
         }
         Some(Command::Status) => {
             cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
