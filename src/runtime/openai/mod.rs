@@ -69,7 +69,14 @@ pub async fn try_route(
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     let provider_keys = crate::core::config::get_provider_keys();
     match resolve_route(model, &provider_keys) {
-        Provider::OpenAi(cfg) => {
+        Provider::OpenAi(mut cfg) => {
+            // For OpenAI OAuth: refresh token if needed before making the call
+            if model.starts_with("openai/") {
+                if let Ok(fresh_creds) = crate::auth::ensure_fresh_openai_token(client).await {
+                    cfg.api_key = fresh_creds.access;
+                }
+            }
+
             let result = stream::call_oai_stream_inner(
                 &cfg, client, tools_schema, system_prompt, messages, tx,
                 temperature, max_tokens, cancel,
