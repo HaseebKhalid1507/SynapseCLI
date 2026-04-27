@@ -1,4 +1,22 @@
-use synaps_cli::auth;
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::io::{self, IsTerminal, Write};
+use synaps_cli::{auth, config};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthKind {
+    OAuth,
+    ApiKey,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoginProvider {
+    key: &'static str,
+    name: &'static str,
+    description: &'static str,
+    auth_kind: AuthKind,
+    recommended: bool,
+}
 
 pub async fn run(profile: Option<String>) {
     if let Some(ref prof) = profile {
@@ -6,6 +24,23 @@ pub async fn run(profile: Option<String>) {
     }
 
     let _log_guard = synaps_cli::logging::init_logging();
+
+    let providers = login_providers();
+    let selected = match select_provider(&providers) {
+        Ok(provider) => provider,
+        Err(e) => {
+            eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
+            std::process::exit(1);
+        }
+    };
+
+    match selected.auth_kind {
+        AuthKind::OAuth => run_oauth_login(selected).await,
+        AuthKind::ApiKey => run_api_key_login(selected),
+    }
+}
+
+async fn run_oauth_login(_provider: LoginProvider) {
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");
     eprintln!("╠══════════════════════════════════════╣");
@@ -38,6 +73,253 @@ pub async fn run(profile: Option<String>) {
     }
 }
 
+fn run_api_key_login(provider: LoginProvider) {
+    eprintln!("╔══════════════════════════════════════╗");
+    eprintln!("║        SynapsCLI — Login             ║");
+    eprintln!("╠══════════════════════════════════════╣");
+    eprintln!("║  Add API key for {:<18}║", provider.name);
+    eprintln!("║  OpenAI-compatible endpoint          ║");
+    eprintln!("╚══════════════════════════════════════╝");
+
+    let config_key = format!("provider.{}", provider.key);
+    if let Some(existing) = config::load_config().provider_keys.get(provider.key) {
+        if !existing.is_empty() {
+            eprintln!("\n\x1b[33m⚠ API key already configured for {}.\x1b[0m", provider.name);
+            eprintln!("  Continuing will replace provider.{}.\n", provider.key);
+        }
+    }
+
+    eprintln!("\nPaste your {} API key.", provider.name);
+    eprint!("{}: ", config_key);
+    let _ = io::stderr().flush();
+
+    let api_key = match read_secret_line() {
+        Ok(api_key) => api_key,
+        Err(e) => {
+            eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
+            std::process::exit(1);
+        }
+    };
+
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        eprintln!("\n\x1b[31m✗ Login failed: API key cannot be empty\x1b[0m");
+        std::process::exit(1);
+    }
+
+    save_api_key(&config_key, provider, api_key);
+}
+
+fn read_secret_line() -> Result<String, String> {
+    if !io::stdin().is_terminal() {
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| e.to_string())?;
+        return Ok(input);
+    }
+
+    let _raw_guard = RawModeGuard::new()?;
+    let mut input = String::new();
+
+    loop {
+        match event::read().map_err(|e| e.to_string())? {
+            Event::Key(key) => match key.code {
+                KeyCode::Enter => {
+                    eprint!("\r\n");
+                    let _ = io::stderr().flush();
+                    return Ok(input);
+                }
+                KeyCode::Esc => {
+                    eprint!("\r\n");
+                    return Err("Login cancelled".to_string());
+                }
+                KeyCode::Backspace => {
+                    if input.pop().is_some() {
+                        eprint!("\x08 \x08");
+                        let _ = io::stderr().flush();
+                    }
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    input.push(c);
+                    eprint!("*");
+                    let _ = io::stderr().flush();
+                }
+                _ => {}
+            },
+            Event::Paste(text) => {
+                input.push_str(&text);
+                eprint!("{}", "*".repeat(text.chars().count()));
+                let _ = io::stderr().flush();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn save_api_key(config_key: &str, provider: LoginProvider, api_key: &str) {
+    match config::write_config_value(config_key, api_key) {
+        Ok(()) => {
+            eprintln!("\n\x1b[32m✓ API key saved!\x1b[0m");
+            eprintln!("  Config key: {}", config_key);
+            eprintln!("  Config file: {}", config::resolve_write_path("config").display());
+            eprintln!("\n  Use models as `{}/<model-id>`.\n", provider.key);
+        }
+        Err(e) => {
+            eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn login_providers() -> Vec<LoginProvider> {
+    let mut providers = vec![LoginProvider {
+        key: "claude",
+        name: "Claude",
+        description: "Claude account OAuth",
+        auth_kind: AuthKind::OAuth,
+        recommended: true,
+    }];
+
+    providers.extend(
+        synaps_cli::runtime::openai::registry::providers()
+            .iter()
+            .map(|provider| LoginProvider {
+                key: provider.key,
+                name: provider.name,
+                description: "API key",
+                auth_kind: AuthKind::ApiKey,
+                recommended: false,
+            }),
+    );
+
+    providers
+}
+
+fn select_provider(providers: &[LoginProvider]) -> Result<LoginProvider, String> {
+    if providers.is_empty() {
+        return Err("No login providers are available".to_string());
+    }
+
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        let visible = filtered_provider_indices(providers, "");
+        render_provider_picker(providers, &visible, 0, "");
+        return Ok(providers[0]);
+    }
+
+    let _raw_guard = RawModeGuard::new()?;
+    let mut selected = 0usize;
+    let mut query = String::new();
+
+    loop {
+        let visible = filtered_provider_indices(providers, &query);
+        if selected >= visible.len() {
+            selected = visible.len().saturating_sub(1);
+        }
+
+        render_provider_picker(providers, &visible, selected, &query);
+        match event::read().map_err(|e| e.to_string())? {
+            Event::Key(key) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(visible.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    eprint!("\r\n");
+                    if let Some(provider_idx) = visible.get(selected) {
+                        return Ok(providers[*provider_idx]);
+                    }
+                }
+                KeyCode::Esc => {
+                    eprint!("\r\n");
+                    return Err("Login cancelled".to_string());
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    selected = 0;
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    query.push(c);
+                    selected = 0;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn filtered_provider_indices(providers: &[LoginProvider], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return (0..providers.len()).collect();
+    }
+
+    providers
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, provider)| {
+            let haystack =
+                format!("{} {} {}", provider.key, provider.name, provider.description).to_lowercase();
+            haystack.contains(&query).then_some(idx)
+        })
+        .collect()
+}
+
+fn render_provider_picker(
+    providers: &[LoginProvider],
+    visible: &[usize],
+    selected: usize,
+    query: &str,
+) {
+    eprint!("\x1b[2J\x1b[H");
+    eprint!("┌ Add credential\r\n");
+    eprint!("│\r\n");
+    eprint!("◇ Select provider\r\n");
+    eprint!("│\r\n");
+    eprint!("│ Search: {}\r\n", query);
+    if visible.is_empty() {
+        eprint!("│ \x1b[2mNo providers match your search.\x1b[0m\r\n");
+    }
+    for (row, provider_idx) in visible.iter().enumerate() {
+        let provider = providers[*provider_idx];
+        let marker = if row == selected { "●" } else { "○" };
+        let suffix = if provider.recommended { " (recommended)" } else { "" };
+        let auth = match provider.auth_kind {
+            AuthKind::OAuth => "oauth",
+            AuthKind::ApiKey => "api key",
+        };
+        eprint!(
+            "│ {} {}{} \x1b[2m{} · {}\x1b[0m\r\n",
+            marker,
+            provider.name,
+            suffix,
+            auth,
+            provider.description
+        );
+    }
+    eprint!("│\r\n");
+    eprint!("└ ↑/↓ to select • Enter: confirm • Type: search • Esc: cancel\r\n");
+    let _ = io::stderr().flush();
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self, String> {
+        enable_raw_mode().map_err(|e| e.to_string())?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
 fn format_expiry(expires_millis: u64) -> String {
     let secs = expires_millis / 1000;
     let now = synaps_cli::epoch_secs();
@@ -57,5 +339,31 @@ fn format_expiry(expires_millis: u64) -> String {
     } else {
         let mins = remaining / 60;
         format!("in {} minutes", mins)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_providers_include_claude_oauth_first() {
+        let providers = login_providers();
+
+        assert_eq!(providers[0].key, "claude");
+        assert_eq!(providers[0].auth_kind, AuthKind::OAuth);
+        assert!(providers[0].recommended);
+    }
+
+    #[test]
+    fn login_providers_include_openai_compatible_api_key_entries() {
+        let providers = login_providers();
+
+        assert!(providers
+            .iter()
+            .any(|provider| provider.key == "openrouter" && provider.auth_kind == AuthKind::ApiKey));
+        assert!(providers
+            .iter()
+            .any(|provider| provider.key == "google" && provider.auth_kind == AuthKind::ApiKey));
     }
 }
