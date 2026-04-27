@@ -239,6 +239,7 @@ pub fn resolve_provider(
             base_url: spec.base_url.to_string(),
             api_key,
             model: spec.default_model.to_string(),
+            provider: spec.key.to_string(),
         },
         spec.default_model,
     ))
@@ -261,6 +262,7 @@ pub fn resolve_provider_model(
         base_url: spec.base_url.to_string(),
         api_key,
         model: model.to_string(),
+        provider: spec.key.to_string(),
     })
 }
 
@@ -268,6 +270,23 @@ pub fn resolve_provider_model(
 pub fn resolve_shorthand(s: &str, overrides: &BTreeMap<String, String>) -> Option<ProviderConfig> {
     let (provider_key, model) = s.split_once('/')?;
     resolve_provider_model(provider_key, model, overrides)
+}
+
+/// Resolve `"openai-codex/model"` shorthand if Codex OAuth is configured.
+pub fn resolve_codex_shorthand(s: &str) -> Option<ProviderConfig> {
+    let (provider_key, model) = s.split_once('/')?;
+    if provider_key != "openai-codex" {
+        return None;
+    }
+    let token = std::env::var("OPENAI_CODEX_ACCESS_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty());
+    Some(ProviderConfig {
+        base_url: "https://chatgpt.com/backend-api".to_string(),
+        api_key: token.unwrap_or_default(),
+        model: model.to_string(),
+        provider: "openai-codex".to_string(),
+    })
 }
 
 /// Resolve a local model endpoint (Ollama, LM Studio, vLLM, llama.cpp, etc.)
@@ -293,6 +312,7 @@ fn resolve_local(model: &str, overrides: &BTreeMap<String, String>) -> ProviderC
         base_url,
         api_key,
         model: model.to_string(),
+        provider: "local".to_string(),
     }
 }
 
