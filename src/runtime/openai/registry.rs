@@ -278,16 +278,9 @@ pub fn resolve_codex_shorthand(s: &str) -> Option<ProviderConfig> {
     if provider_key != "openai-codex" {
         return None;
     }
-    let has_oauth = crate::auth::load_provider_auth("openai-codex")
-        .ok()
-        .flatten()
-        .is_some();
     let token = std::env::var("OPENAI_CODEX_ACCESS_TOKEN")
         .ok()
         .filter(|v| !v.is_empty());
-    if !has_oauth && token.is_none() {
-        return None;
-    }
     Some(ProviderConfig {
         base_url: "https://chatgpt.com/backend-api".to_string(),
         api_key: token.unwrap_or_default(),

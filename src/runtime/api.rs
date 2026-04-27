@@ -707,6 +707,39 @@ impl ApiMethods {
         messages: &[Value],
         max_retries: u32,
     ) -> Result<String> {
+        let tools_schema = Arc::new(Vec::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let routed_system_prompt = Some(system_prompt.to_string());
+        if let Some(result) = crate::runtime::openai::try_route(
+            model,
+            client,
+            &tools_schema,
+            &routed_system_prompt,
+            messages,
+            &tx,
+            None,
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        {
+            drop(tx);
+            while rx.recv().await.is_some() {}
+            let response =
+                result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")))?;
+            let text = response["content"]
+                .as_array()
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter_map(|item| item["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            return Ok(text);
+        }
+
         let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 
         let mut body = json!({

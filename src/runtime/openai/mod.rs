@@ -106,8 +106,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_openai_codex_with_runtime_token() {
-        std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", "token");
+    fn resolves_openai_codex_without_requiring_eager_credentials() {
+        std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
         match resolve_route("openai-codex/gpt-5.1-codex-mini", &BTreeMap::new()) {
             Provider::Codex(cfg) => {
                 assert_eq!(cfg.provider, "openai-codex");
@@ -116,6 +116,5 @@ mod tests {
             }
             other => panic!("expected Codex route, got {other:?}"),
         }
-        std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
     }
 }
