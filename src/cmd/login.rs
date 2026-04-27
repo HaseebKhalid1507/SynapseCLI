@@ -18,6 +18,15 @@ struct LoginProvider {
     recommended: bool,
 }
 
+const LOGIN_BANNER: &[&str] = &[
+    " ███████ ██    ██ ███    ██  █████  ██████  ███████",
+    " ██       ██  ██  ████   ██ ██   ██ ██   ██ ██    ",
+    " ███████   ████   ██ ██  ██ ███████ ██████  ███████",
+    "      ██    ██    ██  ██ ██ ██   ██ ██           ██",
+    " ███████    ██    ██   ████ ██   ██ ██      ███████",
+];
+const LOGIN_PICKER_PADDING: &str = "  ";
+
 pub async fn run(profile: Option<String>) {
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
@@ -40,36 +49,49 @@ pub async fn run(profile: Option<String>) {
     }
 }
 
-async fn run_oauth_login(_provider: LoginProvider) {
+async fn run_oauth_login(provider: LoginProvider) {
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");
     eprintln!("╠══════════════════════════════════════╣");
-    eprintln!("║  Sign in with your Claude account    ║");
-    eprintln!("║  (Pro, Max, Team, or Enterprise)     ║");
+    eprintln!("║  Sign in with {:<20}║", provider.name);
+    eprintln!("║  {:<36}║", provider.description);
     eprintln!("╚══════════════════════════════════════╝");
 
-    if let Ok(Some(existing)) = auth::load_auth() {
-        if !auth::is_token_expired(&existing.anthropic) {
+    if let Ok(Some(existing)) = auth::load_provider_auth(oauth_storage_key(provider)) {
+        if !auth::is_token_expired(&existing) {
             eprintln!("\n\x1b[33m⚠ Already logged in with a valid token.\x1b[0m");
-            eprintln!("  Expires: {}", format_expiry(existing.anthropic.expires));
+            eprintln!("  Expires: {}", format_expiry(existing.expires));
             eprintln!("  Continuing will replace your current credentials.\n");
         } else {
             eprintln!("\n\x1b[33m⚠ Existing token is expired. Logging in fresh.\x1b[0m\n");
         }
     }
 
-    match auth::login().await {
+    let result = match provider.key {
+        "claude" => auth::login().await,
+        "openai-codex" => auth::login_openai_codex().await,
+        _ => Err(format!("No OAuth login handler for {}", provider.name)),
+    };
+
+    match result {
         Ok(creds) => {
             eprintln!("\n\x1b[32m✓ Login successful!\x1b[0m");
             eprintln!("  Token saved to: {}", auth::auth_file_path().display());
             eprintln!("  Expires: {}", format_expiry(creds.expires));
-            eprintln!("\n  You can now use SynapsCLI. 🎉\n");
+            eprintln!("\n  You can now use SynapsCLI.\n");
         }
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
             eprintln!("  Please try again.\n");
             std::process::exit(1);
         }
+    }
+}
+
+fn oauth_storage_key(provider: LoginProvider) -> &'static str {
+    match provider.key {
+        "claude" => "anthropic",
+        other => other,
     }
 }
 
@@ -179,6 +201,12 @@ fn login_providers() -> Vec<LoginProvider> {
         description: "Claude account OAuth",
         auth_kind: AuthKind::OAuth,
         recommended: true,
+    }, LoginProvider {
+        key: "openai-codex",
+        name: "OpenAI Codex",
+        description: "ChatGPT Plus/Pro OAuth",
+        auth_kind: AuthKind::OAuth,
+        recommended: false,
     }];
 
     providers.extend(
@@ -275,13 +303,21 @@ fn render_provider_picker(
     query: &str,
 ) {
     eprint!("\x1b[2J\x1b[H");
-    eprint!("┌ Add credential\r\n");
-    eprint!("│\r\n");
-    eprint!("◇ Select provider\r\n");
-    eprint!("│\r\n");
-    eprint!("│ Search: {}\r\n", query);
+    eprint!("\r\n");
+    for line in LOGIN_BANNER {
+        eprint!("{}{}\r\n", LOGIN_PICKER_PADDING, line);
+    }
+    eprint!("\r\n");
+    eprint!("{}┌ Add credential\r\n", LOGIN_PICKER_PADDING);
+    eprint!("{}│\r\n", LOGIN_PICKER_PADDING);
+    eprint!("{}◇ Select provider\r\n", LOGIN_PICKER_PADDING);
+    eprint!("{}│\r\n", LOGIN_PICKER_PADDING);
+    eprint!("{}│ Search: {}\r\n", LOGIN_PICKER_PADDING, query);
     if visible.is_empty() {
-        eprint!("│ \x1b[2mNo providers match your search.\x1b[0m\r\n");
+        eprint!(
+            "{}│ \x1b[2mNo providers match your search.\x1b[0m\r\n",
+            LOGIN_PICKER_PADDING
+        );
     }
     for (row, provider_idx) in visible.iter().enumerate() {
         let provider = providers[*provider_idx];
@@ -292,7 +328,8 @@ fn render_provider_picker(
             AuthKind::ApiKey => "api key",
         };
         eprint!(
-            "│ {} {}{} \x1b[2m{} · {}\x1b[0m\r\n",
+            "{}│ {} {}{} \x1b[2m{} · {}\x1b[0m\r\n",
+            LOGIN_PICKER_PADDING,
             marker,
             provider.name,
             suffix,
@@ -300,8 +337,11 @@ fn render_provider_picker(
             provider.description
         );
     }
-    eprint!("│\r\n");
-    eprint!("└ ↑/↓ to select • Enter: confirm • Type: search • Esc: cancel\r\n");
+    eprint!("{}│\r\n", LOGIN_PICKER_PADDING);
+    eprint!(
+        "{}└ ↑/↓ to select • Enter: confirm • Type: search • Esc: cancel\r\n",
+        LOGIN_PICKER_PADDING
+    );
     let _ = io::stderr().flush();
 }
 
@@ -353,6 +393,8 @@ mod tests {
         assert_eq!(providers[0].key, "claude");
         assert_eq!(providers[0].auth_kind, AuthKind::OAuth);
         assert!(providers[0].recommended);
+        assert_eq!(providers[1].key, "openai-codex");
+        assert_eq!(providers[1].auth_kind, AuthKind::OAuth);
     }
 
     #[test]

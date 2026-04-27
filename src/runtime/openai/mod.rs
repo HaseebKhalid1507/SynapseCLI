@@ -26,6 +26,8 @@ pub enum Provider {
     Anthropic,
     /// OpenAI-compatible provider with a resolved config.
     OpenAi(ProviderConfig),
+    /// ChatGPT subscription-backed Codex responses endpoint.
+    Codex(ProviderConfig),
     /// Known provider prefix but no API key configured.
     MissingKey(String),
 }
@@ -37,6 +39,12 @@ pub enum Provider {
 /// - anything else → `Anthropic` (backward compat)
 pub fn resolve_route(model: &str, provider_keys: &BTreeMap<String, String>) -> Provider {
     if let Some((prefix, _rest)) = model.split_once('/') {
+        if prefix == "openai-codex" {
+            if let Some(cfg) = registry::resolve_codex_shorthand(model) {
+                return Provider::Codex(cfg);
+            }
+            return Provider::MissingKey(prefix.to_string());
+        }
         if prefix == "local" || registry::providers().iter().any(|s| s.key == prefix) {
             if let Some(cfg) = registry::resolve_shorthand(model, provider_keys) {
                 return Provider::OpenAi(cfg);
@@ -76,6 +84,13 @@ pub async fn try_route(
             ).await;
             Some(result)
         }
+        Provider::Codex(cfg) => {
+            let result = stream::call_codex_stream_inner(
+                &cfg, client, tools_schema, system_prompt, messages, tx,
+                temperature, max_tokens, cancel,
+            ).await;
+            Some(result)
+        }
         Provider::Anthropic => None,
         Provider::MissingKey(provider) => {
             Some(Err(format!(
@@ -83,5 +98,24 @@ pub async fn try_route(
                 provider, provider
             ).into()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_openai_codex_with_runtime_token() {
+        std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", "token");
+        match resolve_route("openai-codex/gpt-5.1-codex-mini", &BTreeMap::new()) {
+            Provider::Codex(cfg) => {
+                assert_eq!(cfg.provider, "openai-codex");
+                assert_eq!(cfg.model, "gpt-5.1-codex-mini");
+                assert!(cfg.base_url.contains("chatgpt.com/backend-api"));
+            }
+            other => panic!("expected Codex route, got {other:?}"),
+        }
+        std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
     }
 }
