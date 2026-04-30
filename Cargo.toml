@@ -69,7 +69,7 @@ libc = "0.2"
 tempfile = "3"
 
 [features]
-default = []
+default = ["voice-stt-whisper", "voice-mic"]
 voice = []
 voice-stt-whisper = ["voice", "dep:whisper-rs"]
 voice-mic = ["voice", "dep:cpal"]
