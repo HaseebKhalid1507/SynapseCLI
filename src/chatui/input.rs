@@ -371,7 +371,10 @@ fn handle_key(
     }
     match (code, modifiers) {
         (KeyCode::F(8), _) => {
-            return InputAction::VoiceControlPressed;
+            return match kind {
+                crossterm::event::KeyEventKind::Release => InputAction::VoiceControlReleased,
+                _ => InputAction::VoiceControlPressed,
+            };
         }
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             return InputAction::Quit;
@@ -631,6 +634,30 @@ mod voice_keybind_tests {
             .unwrap();
         runtime.set_model("test-model".to_string());
         runtime
+    }
+
+    #[test]
+    fn f8_press_and_release_support_toggle_without_double_toggling() {
+        let mut app = App::new(synaps_cli::Session::new("test-model", "low", None));
+        let runtime = test_runtime();
+        let (registry, keybinds) = registries();
+        let press = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        let release = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+
+        let press_action = handle_event(press, &mut app, &runtime, false, &registry, &keybinds);
+        let release_action = handle_event(release, &mut app, &runtime, false, &registry, &keybinds);
+
+        assert!(matches!(press_action, InputAction::VoiceControlPressed));
+        assert!(matches!(release_action, InputAction::VoiceControlReleased));
+        assert!(app.input.is_empty());
     }
 
     #[test]
