@@ -315,7 +315,7 @@ fn handle_voice_event_for_input(
 ) -> InputAction {
     match event {
         synaps_cli::VoiceEvent::FinalTranscript(transcript) => {
-            if !app.voice.listening {
+            if !app.voice.enabled {
                 return InputAction::None;
             }
             match voice_input::handle_voice_transcript(app, &transcript, max_transcript_chars, command_config) {
