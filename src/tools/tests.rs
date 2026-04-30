@@ -390,6 +390,7 @@ async fn test_bash_tool_requested_timeout_is_not_clamped_by_max_timeout() {
 }
 
 
+
 #[tokio::test]
 async fn test_bash_fake_sudo_prompt_uses_secret_prompt_and_redacts_password() {
     let tool = BashTool;
