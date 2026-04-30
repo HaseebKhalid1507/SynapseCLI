@@ -505,17 +505,7 @@ pub async fn run(
     };
     let mut voice_runtime: Option<synaps_cli::VoiceRuntime> = if config.voice.enabled {
         match build_voice_runtime(&config.voice) {
-            Ok(mut voice_runtime) => {
-                if app.voice.mode == app::VoiceUiMode::Toggle {
-                    if let Err(err) = voice_runtime.start_listening() {
-                        tracing::warn!("voice startup failed: {}", err);
-                        app.voice.last_error = Some(err.to_string());
-                    } else {
-                        app.voice.listening = true;
-                    }
-                }
-                Some(voice_runtime)
-            }
+            Ok(voice_runtime) => Some(voice_runtime),
             Err(err) => {
                 tracing::warn!("voice setup failed: {}", err);
                 app.voice.last_error = Some(err.to_string());
