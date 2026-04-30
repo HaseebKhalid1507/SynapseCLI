@@ -3,6 +3,59 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use crate::tools::shell::config::ShellConfig;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoiceConfig {
+    pub enabled: bool,
+    pub mode: String,
+    pub stt_backend: String,
+    pub stt_model_path: PathBuf,
+    pub stt_language: String,
+    pub stt_show_partials: bool,
+    pub stt_auto_submit: bool,
+    pub stt_silence_submit_ms: u64,
+    pub stt_vad_rms_threshold: f32,
+    pub stt_min_speech_ms: u64,
+    pub stt_preroll_ms: u64,
+    pub stt_max_utterance_ms: u64,
+    pub max_transcript_chars: usize,
+    pub tts_enabled: bool,
+    pub tts_backend: String,
+    pub tts_model_path: PathBuf,
+    pub tts_voices_path: PathBuf,
+    pub tts_voice: String,
+    pub tts_auto_speak: bool,
+    pub commands_enabled: bool,
+    pub commands_submit_enabled: bool,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "toggle".to_string(),
+            stt_backend: "whisper-rs".to_string(),
+            stt_model_path: PathBuf::from("~/.synaps-cli/models/whisper/ggml-base.en.bin"),
+            stt_language: "en".to_string(),
+            stt_show_partials: true,
+            stt_auto_submit: false,
+            stt_silence_submit_ms: 1000,
+            stt_vad_rms_threshold: 0.01,
+            stt_min_speech_ms: 250,
+            stt_preroll_ms: 300,
+            stt_max_utterance_ms: 30_000,
+            max_transcript_chars: 16_000,
+            tts_enabled: false,
+            tts_backend: "kokoros".to_string(),
+            tts_model_path: PathBuf::from("~/.synaps-cli/models/kokoro/kokoro-v1.0.onnx"),
+            tts_voices_path: PathBuf::from("~/.synaps-cli/models/kokoro/voices-v1.0.bin"),
+            tts_voice: "af_sky".to_string(),
+            tts_auto_speak: false,
+            commands_enabled: true,
+            commands_submit_enabled: false,
+        }
+    }
+}
+
 static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
 static PROVIDER_KEYS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 
@@ -99,6 +152,7 @@ pub struct SynapsConfig {
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
     pub shell: ShellConfig,
+    pub voice: VoiceConfig,
     pub provider_keys: BTreeMap<String, String>,
     pub keybinds: std::collections::HashMap<String, String>,
 }
@@ -120,6 +174,7 @@ impl Default for SynapsConfig {
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             shell: ShellConfig::default(),
+            voice: VoiceConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
         }
@@ -147,6 +202,139 @@ fn parse_comma_list(val: &str) -> Vec<String> {
 
 fn write_comma_list(key: &str, values: &[String]) -> std::io::Result<()> {
     write_config_value(key, &values.join(", "))
+}
+
+fn parse_bool(val: &str) -> Option<bool> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_voice_config_key(voice_config: &mut VoiceConfig, key: &str, val: &str) {
+    match key {
+        "voice.enabled" => {
+            if let Some(enabled) = parse_bool(val) {
+                voice_config.enabled = enabled;
+            } else {
+                eprintln!("Warning: invalid value for voice.enabled: '{}', using default", val);
+            }
+        }
+        "voice.mode" => {
+            if matches!(val, "push_to_talk" | "toggle") {
+                voice_config.mode = val.to_string();
+            } else {
+                eprintln!("Warning: invalid value for voice.mode: '{}', using default", val);
+            }
+        }
+        "voice.stt_backend" => {
+            if val == "whisper-rs" {
+                voice_config.stt_backend = val.to_string();
+            } else {
+                eprintln!("Warning: invalid value for voice.stt_backend: '{}', using default", val);
+            }
+        }
+        "voice.stt_model_path" => voice_config.stt_model_path = PathBuf::from(val),
+        "voice.stt_language" => voice_config.stt_language = val.to_string(),
+        "voice.stt_show_partials" => {
+            if let Some(show_partials) = parse_bool(val) {
+                voice_config.stt_show_partials = show_partials;
+            } else {
+                eprintln!("Warning: invalid value for voice.stt_show_partials: '{}', using default", val);
+            }
+        }
+        "voice.stt_auto_submit" => {
+            if let Some(auto_submit) = parse_bool(val) {
+                voice_config.stt_auto_submit = auto_submit;
+            } else {
+                eprintln!("Warning: invalid value for voice.stt_auto_submit: '{}', using default", val);
+            }
+        }
+        "voice.stt_silence_submit_ms" => {
+            if let Ok(silence_ms) = val.parse::<u64>() {
+                voice_config.stt_silence_submit_ms = silence_ms;
+            } else {
+                eprintln!("Warning: invalid value for voice.stt_silence_submit_ms: '{}', using default", val);
+            }
+        }
+        "voice.stt_vad_rms_threshold" => {
+            if let Ok(threshold) = val.parse::<f32>() {
+                voice_config.stt_vad_rms_threshold = threshold;
+            } else {
+                eprintln!("Warning: invalid value for voice.stt_vad_rms_threshold: '{}', using default", val);
+            }
+        }
+        "voice.stt_min_speech_ms" => {
+            if let Ok(min_speech_ms) = val.parse::<u64>() {
+                voice_config.stt_min_speech_ms = min_speech_ms;
+            } else {
+                eprintln!("Warning: invalid value for voice.stt_min_speech_ms: '{}', using default", val);
+            }
+        }
+        "voice.stt_preroll_ms" => {
+            if let Ok(preroll_ms) = val.parse::<u64>() {
+                voice_config.stt_preroll_ms = preroll_ms;
+            } else {
+                eprintln!("Warning: invalid value for voice.stt_preroll_ms: '{}', using default", val);
+            }
+        }
+        "voice.stt_max_utterance_ms" => {
+            if let Ok(max_utterance_ms) = val.parse::<u64>() {
+                voice_config.stt_max_utterance_ms = max_utterance_ms;
+            } else {
+                eprintln!("Warning: invalid value for voice.stt_max_utterance_ms: '{}', using default", val);
+            }
+        }
+        "voice.max_transcript_chars" => {
+            if let Ok(max_chars) = val.parse::<usize>() {
+                voice_config.max_transcript_chars = max_chars;
+            } else {
+                eprintln!("Warning: invalid value for voice.max_transcript_chars: '{}', using default", val);
+            }
+        }
+        "voice.tts_enabled" => {
+            if let Some(enabled) = parse_bool(val) {
+                voice_config.tts_enabled = enabled;
+            } else {
+                eprintln!("Warning: invalid value for voice.tts_enabled: '{}', using default", val);
+            }
+        }
+        "voice.tts_backend" => {
+            if val == "kokoros" {
+                voice_config.tts_backend = val.to_string();
+            } else {
+                eprintln!("Warning: invalid value for voice.tts_backend: '{}', using default", val);
+            }
+        }
+        "voice.tts_model_path" => voice_config.tts_model_path = PathBuf::from(val),
+        "voice.tts_voices_path" => voice_config.tts_voices_path = PathBuf::from(val),
+        "voice.tts_voice" => voice_config.tts_voice = val.to_string(),
+        "voice.tts_auto_speak" => {
+            if let Some(auto_speak) = parse_bool(val) {
+                voice_config.tts_auto_speak = auto_speak;
+            } else {
+                eprintln!("Warning: invalid value for voice.tts_auto_speak: '{}', using default", val);
+            }
+        }
+        "voice.commands_enabled" => {
+            if let Some(enabled) = parse_bool(val) {
+                voice_config.commands_enabled = enabled;
+            } else {
+                eprintln!("Warning: invalid value for voice.commands_enabled: '{}', using default", val);
+            }
+        }
+        "voice.commands.submit_enabled" => {
+            if let Some(enabled) = parse_bool(val) {
+                voice_config.commands_submit_enabled = enabled;
+            } else {
+                eprintln!("Warning: invalid value for voice.commands.submit_enabled: '{}', using default", val);
+            }
+        }
+        _ => {
+            // Unknown voice.* keys are preserved (not rejected)
+        }
+    }
 }
 
 /// Parse shell.* configuration keys and update the ShellConfig.
@@ -218,16 +406,9 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
     }
 }
 
-/// Parse the config file at ~/.synaps-cli/config (or profile variant).
-/// Returns default config if file doesn't exist or can't be read.
-pub fn load_config() -> SynapsConfig {
-    let path = resolve_read_path("config");
+fn parse_config_content(content: &str) -> SynapsConfig {
     let mut config = SynapsConfig::default();
-    
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return config;
-    };
-    
+
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
@@ -285,6 +466,8 @@ pub fn load_config() -> SynapsConfig {
                 // Handle shell.* keys
                 if key.starts_with("shell.") {
                     parse_shell_config_key(&mut config.shell, key, val);
+                } else if key.starts_with("voice.") {
+                    parse_voice_config_key(&mut config.voice, key, val);
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
                     config.provider_keys.insert(provider_key.to_string(), val.to_string());
                 } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
@@ -294,6 +477,19 @@ pub fn load_config() -> SynapsConfig {
             }
         }
     }
+
+    config
+}
+
+/// Parse the config file at ~/.synaps-cli/config (or profile variant).
+/// Returns default config if file doesn't exist or can't be read.
+pub fn load_config() -> SynapsConfig {
+    let path = resolve_read_path("config");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return SynapsConfig::default();
+    };
+
+    let config = parse_config_content(&content);
 
     // Publish provider keys to the process-wide cache for the API router.
     // First writer wins (OnceLock) — subsequent load_config calls are no-ops.
@@ -446,6 +642,27 @@ mod tests {
         assert!(config.disabled_skills.is_empty());
         assert_eq!(config.shell.max_sessions, 5);
         assert_eq!(config.shell.idle_timeout.as_secs(), 600);
+        assert!(!config.voice.enabled);
+        assert_eq!(config.voice.mode, "toggle");
+        assert_eq!(config.voice.stt_backend, "whisper-rs");
+        assert_eq!(config.voice.stt_model_path, PathBuf::from("~/.synaps-cli/models/whisper/ggml-base.en.bin"));
+        assert_eq!(config.voice.stt_language, "en");
+        assert!(config.voice.stt_show_partials);
+        assert!(!config.voice.stt_auto_submit);
+        assert_eq!(config.voice.stt_silence_submit_ms, 1000);
+        assert_eq!(config.voice.stt_vad_rms_threshold, 0.01);
+        assert_eq!(config.voice.stt_min_speech_ms, 250);
+        assert_eq!(config.voice.stt_preroll_ms, 300);
+        assert_eq!(config.voice.stt_max_utterance_ms, 30_000);
+        assert_eq!(config.voice.max_transcript_chars, 16_000);
+        assert!(!config.voice.tts_enabled);
+        assert_eq!(config.voice.tts_backend, "kokoros");
+        assert_eq!(config.voice.tts_model_path, PathBuf::from("~/.synaps-cli/models/kokoro/kokoro-v1.0.onnx"));
+        assert_eq!(config.voice.tts_voices_path, PathBuf::from("~/.synaps-cli/models/kokoro/voices-v1.0.bin"));
+        assert_eq!(config.voice.tts_voice, "af_sky");
+        assert!(!config.voice.tts_auto_speak);
+        assert!(config.voice.commands_enabled);
+        assert!(!config.voice.commands_submit_enabled);
     }
 
     fn make_test_home(subdir: &str) -> std::path::PathBuf {
@@ -543,6 +760,95 @@ mod tests {
         let contents = std::fs::read_to_string(&cfg).unwrap();
         assert!(contents.contains("model = claude-sonnet-4-6"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn load_config_parses_voice_keys() {
+        let config = parse_config_content(r#"
+voice.enabled = true
+voice.mode = toggle
+voice.stt_backend = whisper-rs
+voice.stt_model_path = /models/whisper.bin
+voice.stt_language = es
+voice.stt_show_partials = false
+voice.stt_auto_submit = true
+voice.stt_silence_submit_ms = 1500
+voice.stt_vad_rms_threshold = 0.02
+voice.stt_min_speech_ms = 300
+voice.stt_preroll_ms = 400
+voice.stt_max_utterance_ms = 45000
+voice.max_transcript_chars = 8000
+voice.tts_enabled = true
+voice.tts_backend = kokoros
+voice.tts_model_path = /models/kokoro.onnx
+voice.tts_voices_path = /models/voices.bin
+voice.tts_voice = af_heart
+voice.tts_auto_speak = true
+voice.commands_enabled = false
+voice.commands.submit_enabled = true
+voice.future_unknown = preserved-by-ignored-parser
+"#);
+        assert!(config.voice.enabled);
+        assert_eq!(config.voice.mode, "toggle");
+        assert_eq!(config.voice.stt_backend, "whisper-rs");
+        assert_eq!(config.voice.stt_model_path, PathBuf::from("/models/whisper.bin"));
+        assert_eq!(config.voice.stt_language, "es");
+        assert!(!config.voice.stt_show_partials);
+        assert!(config.voice.stt_auto_submit);
+        assert_eq!(config.voice.stt_silence_submit_ms, 1500);
+        assert_eq!(config.voice.stt_vad_rms_threshold, 0.02);
+        assert_eq!(config.voice.stt_min_speech_ms, 300);
+        assert_eq!(config.voice.stt_preroll_ms, 400);
+        assert_eq!(config.voice.stt_max_utterance_ms, 45_000);
+        assert_eq!(config.voice.max_transcript_chars, 8_000);
+        assert!(config.voice.tts_enabled);
+        assert_eq!(config.voice.tts_backend, "kokoros");
+        assert_eq!(config.voice.tts_model_path, PathBuf::from("/models/kokoro.onnx"));
+        assert_eq!(config.voice.tts_voices_path, PathBuf::from("/models/voices.bin"));
+        assert_eq!(config.voice.tts_voice, "af_heart");
+        assert!(config.voice.tts_auto_speak);
+        assert!(!config.voice.commands_enabled);
+        assert!(config.voice.commands_submit_enabled);
+    }
+
+    #[test]
+    fn invalid_voice_values_keep_defaults() {
+        let config = parse_config_content(r#"
+voice.enabled = maybe
+voice.stt_show_partials = maybe
+voice.stt_auto_submit = maybe
+voice.stt_silence_submit_ms = nope
+voice.stt_vad_rms_threshold = nope
+voice.stt_min_speech_ms = nope
+voice.stt_preroll_ms = nope
+voice.stt_max_utterance_ms = nope
+voice.max_transcript_chars = nope
+voice.tts_enabled = maybe
+voice.tts_auto_speak = maybe
+"#);
+        assert!(!config.voice.enabled);
+        assert!(config.voice.stt_show_partials);
+        assert!(!config.voice.stt_auto_submit);
+        assert_eq!(config.voice.stt_silence_submit_ms, 1000);
+        assert_eq!(config.voice.stt_vad_rms_threshold, 0.01);
+        assert_eq!(config.voice.stt_min_speech_ms, 250);
+        assert_eq!(config.voice.stt_preroll_ms, 300);
+        assert_eq!(config.voice.stt_max_utterance_ms, 30_000);
+        assert_eq!(config.voice.max_transcript_chars, 16_000);
+        assert!(!config.voice.tts_enabled);
+        assert!(!config.voice.tts_auto_speak);
+    }
+
+    #[test]
+    fn invalid_voice_enum_values_keep_defaults() {
+        let config = parse_config_content(r#"
+voice.mode = continuous
+voice.stt_backend = deepgram
+voice.tts_backend = elevenlabs
+"#);
+        assert_eq!(config.voice.mode, "toggle");
+        assert_eq!(config.voice.stt_backend, "whisper-rs");
+        assert_eq!(config.voice.tts_backend, "kokoros");
     }
 
     #[test]

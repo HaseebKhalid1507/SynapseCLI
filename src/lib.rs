@@ -4,6 +4,7 @@ pub mod tools;
 pub mod mcp;
 pub mod skills;
 pub mod events;
+pub mod voice;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;
@@ -15,12 +16,22 @@ pub use core::error;
 pub use core::watcher_types;
 pub use core::models;
 pub use core::chain;
+pub use voice::{
+    SpeechToTextProvider, TextToSpeechProvider, VoiceEvent, VoiceEventReceiver, VoiceEventSender,
+    VoiceProviderState, VoiceRuntime, VoiceRuntimeHandle,
+    sanitize_voice_transcript, DEFAULT_MAX_VOICE_TRANSCRIPT_CHARS,
+    map_spoken_phrase, VoiceCommandAction, VoiceCommandConfig,
+};
+#[cfg(feature = "voice-stt-whisper")]
+pub use voice::WhisperSttProvider;
+#[cfg(all(feature = "voice-stt-whisper", feature = "voice-mic"))]
+pub use voice::run_whisper_mic_demo;
 
 pub use runtime::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 pub use tools::{Tool, ToolContext, ToolRegistry};
 pub use session::{Session, SessionInfo, find_session, latest_session, list_sessions, resolve_session, find_session_by_name, validate_name};
 pub use error::{RuntimeError, Result};
-pub use config::{SynapsConfig, load_config, resolve_system_prompt};
+pub use config::{SynapsConfig, VoiceConfig, load_config, resolve_system_prompt};
 pub use watcher_types::{
     AgentConfig, SessionLimits, HandoffState, ExitReason, SessionStats,
     WatcherCommand, WatcherResponse, AgentStatusInfo
