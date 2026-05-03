@@ -35,6 +35,12 @@ enum Command {
         agent: Option<String>,
         #[arg(long, short = 'S')]
         system: Option<String>,
+        /// Override the model
+        #[arg(long, short)]
+        model: Option<String>,
+        /// Output structured JSON (for benchmarks/automation)
+        #[arg(long)]
+        print: bool,
     },
     /// Plain text streaming chat
     Chat,
@@ -125,8 +131,8 @@ async fn main() -> anyhow::Result<()> {
         None => {
             chatui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
         }
-        Some(Command::Run { prompt, agent, system }) => {
-            cmd::run::run(prompt, agent, system).await?;
+        Some(Command::Run { prompt, agent, system, model, print }) => {
+            cmd::run::run(prompt, agent, system, model, print).await?;
         }
         Some(Command::Chat) => {
             cmd::chat::run().await?;
